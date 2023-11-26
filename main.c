@@ -10,7 +10,7 @@
 /////////////
 
 #define BLOCK_SIZE 32
-#define DEBUG 1
+#define DEBUG 0
 
 #define TAG_CONFIG 1
 #define TAG_DATA 2
@@ -39,6 +39,8 @@ fprintf(stderr, fmt, ##__VA_ARGS__); \
 #else
 #define dbg_print_clean(fmt, ...) do {} while (0)
 #endif
+
+#define errprintf(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__)
 
 /////////////////////
 // Types & Structs //
@@ -204,6 +206,10 @@ DatasetPartition* generate_distributed_matrix(
     const int my_rank
 ) {
     DatasetPartition* my_data = malloc(sizeof(DatasetPartition));
+    if (my_data == NULL) {
+        errprintf("Failed to alloc local partition data");
+        exit(1);
+    }
 
     // The generator node
     if (my_rank == 0) {
@@ -215,9 +221,17 @@ DatasetPartition* generate_distributed_matrix(
         // Currently generating block (since, theoretically, not all data can be held by a single node)
         // Represented in row major fashion to suit the problem requirements
         data_t* work_data = malloc(n * BLOCK_SIZE * sizeof(data_t));
+        if (work_data == NULL) {
+            errprintf("Failed to alloc work_data buffer (matrix generation)");
+            exit(1);
+        }
 
         // Configuration for each node
         PartitionConfig* configs = malloc(cluster_size * sizeof(PartitionConfig));
+        if (configs == NULL) {
+            errprintf("Failed to alloc configs temp array (matrix generation)");
+            exit(1);
+        }
 
         /**
          * Partiotining strategy: in order to ensure a more even workload distribution accross all members,
@@ -236,6 +250,10 @@ DatasetPartition* generate_distributed_matrix(
             configs[i].n = n;
             configs[i].n_owned_cols = 0;
             configs[i].owned_cols = malloc(base_size * sizeof(uint32_t));
+            if (configs[i].owned_cols == NULL) {
+                errprintf("Failed to alloc configs[%u] owned collumns array (matrix generation)", i);
+                exit(1);
+            }
         }
 
         // Assign the columns to each node
@@ -262,6 +280,10 @@ DatasetPartition* generate_distributed_matrix(
 
         // Transfer data as an array
         uint32_t* config_buffer = malloc((base_size + 2) * sizeof(uint32_t));
+        if (config_buffer == NULL) {
+            errprintf("Failed to alloc config buffer for MPI transfer (matrix generation)");
+            exit(1);
+        }
 
         // Send the partition configs to the other nodes
         for (int i = 1; i < cluster_size; i++) {
@@ -276,12 +298,20 @@ DatasetPartition* generate_distributed_matrix(
 
         // Allocate my data partition
         my_data->data = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
+        if (my_data->data == NULL) {
+            errprintf("Failed to alloc local data partition (matrix generation)");
+            exit(1);
+        }
 
         // Number of blocks to be sent
         const uint32_t block_count = (n - 1) / BLOCK_SIZE + 1;
 
         // Allocate buffer for data sending
         uint8_t* data_buffer = malloc(base_size * n * sizeof(data_t) + 2  * sizeof(uint32_t));
+        if (my_data->data == NULL) {
+            errprintf("Failed to alloc data buffer for MPI transfer (matrix generation)");
+            exit(1);
+        }
 
         // Generate & send blocks
         for (uint32_t i = 0; i < block_count; i++) {
@@ -354,7 +384,7 @@ DatasetPartition* generate_distributed_matrix(
         }
         free(configs);
         free(work_data);
-        // free(data_buffer);
+        free(data_buffer);
         free(config_buffer);
         return my_data;
     }
@@ -371,21 +401,39 @@ DatasetPartition* generate_distributed_matrix(
 
     // Receive configs
     uint32_t* config_buffer = malloc(config_len * sizeof(uint32_t));
+    if (config_buffer == NULL) {
+        errprintf("Failed to alloc config buffer for MPI transfer (matrix generation)");
+        exit(1);
+    }
+
     MPI_Recv(config_buffer, config_len, MPI_UNSIGNED, 0, TAG_CONFIG, MPI_COMM_WORLD, &config_status);
 
     // Load config data
     my_data->config.n = config_buffer[0];
     my_data->config.n_owned_cols = config_buffer[1];
     my_data->config.owned_cols = malloc(my_data->config.n_owned_cols * sizeof(uint32_t));
+    if (my_data->config.owned_cols == NULL) {
+        errprintf("Failed to alloc owned cols array (matrix generation)");
+        exit(1);
+    }
+
     memcpy(my_data->config.owned_cols, &config_buffer[2], sizeof(uint32_t) * my_data->config.n_owned_cols);
 
     // Allocate my data partition
     my_data->data = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
+    if (my_data->data == NULL) {
+        errprintf("Failed to alloc local data partition (matrix generation)");
+        exit(1);
+    }
 
     // Receive this partition's data
     MPI_Status data_status;
     int32_t data_size;
     uint8_t* data_buffer = malloc(sizeof(uint32_t) * 2 + BLOCK_SIZE * my_data->config.n_owned_cols * sizeof(data_t));
+    if (data_buffer == NULL) {
+        errprintf("Failed to alloc data buffer for MPI transfer (matrix generation)");
+        exit(1);
+    }
     uint32_t received_rows = 0;
 
     while (received_rows < n) {
