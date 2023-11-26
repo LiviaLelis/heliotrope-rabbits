@@ -123,7 +123,7 @@ int main(int argc, char* argv[]) {
     if (DEBUG) {
         dbg_print("Partition %u data:\n", my_rank);
         for (uint32_t i = 0; i < my_data->config.n_owned_cols; i++) {
-            dbg_print_clean("Column %u: [", my_data->config.owned_cols[i]);
+            dbg_print_clean("Column (%u) %u: [", i, my_data->config.owned_cols[i]);
             for (uint32_t j = 0; j < my_data->config.n; j++) {
                 if (j != 0) {
                     dbg_print_clean(", ");
@@ -162,31 +162,31 @@ void parse_args(const int argc, char* argv[], uint32_t* n, uint32_t* seed, uint3
     // Load matrix rank
     if (argc >= 2) {
         *n = strtoul(argv[1], NULL, 10);
-        dbg_print("Received CLI arg n=%u", *n);
+        dbg_print("Received CLI arg n=%u\n", *n);
     }
     else {
         *n = 100;
-        dbg_print("Using fallback CLI arg n=%u", *n);
+        dbg_print("Using fallback CLI arg n=%u\n", *n);
     }
 
     // Load RNG seed
     if (argc >= 3) {
         *seed = strtoul(argv[2], NULL, 10);
-        dbg_print("Received CLI arg seed=%u", *seed);
+        dbg_print("Received CLI arg seed=%u\n", *seed);
     }
     else {
         *seed = 1;
-        dbg_print("Using fallback CLI arg seed=%u", *seed);
+        dbg_print("Using fallback CLI arg seed=%u\n", *seed);
     }
 
     // Load local thread count to be used
     if (argc >= 4) {
         *thread_count = strtoul(argv[3], NULL, 10);
-        dbg_print("Received CLI arg thread_count=%u", *thread_count);
+        dbg_print("Received CLI arg thread_count=%u\n", *thread_count);
     }
     else {
         *thread_count = omp_get_num_procs();
-        dbg_print("Using fallback CLI arg thread_count=%u", *thread_count);
+        dbg_print("Using fallback CLI arg thread_count=%u\n", *thread_count);
     }
 }
 
@@ -216,7 +216,7 @@ DatasetPartition* generate_distributed_matrix(
         // Seed RNG
         srand(seed);
 
-        dbg_print("Creating partition configurations");
+        dbg_print("Creating partition configurations\n");
 
         // Currently generating block (since, theoretically, not all data can be held by a single node)
         // Represented in row major fashion to suit the problem requirements
@@ -259,11 +259,10 @@ DatasetPartition* generate_distributed_matrix(
         // Assign the columns to each node
         uint32_t node = 0;
         for (uint32_t i = 0; i < n; i++) {
-            const uint32_t intra_idx = i / cluster_size;
+            const uint32_t intra_idx = configs[node].n_owned_cols;
+            dbg_print("Assigned column (%u @ %u) to node %u\n", i, intra_idx, node);
             configs[node].n_owned_cols++;
             configs[node].owned_cols[intra_idx] = i;
-
-            dbg_print("Assigned column (%u) to node %u\n", i, node);
 
             // Alternate iteration order
             if (i % cluster_size == 0) {
@@ -277,6 +276,8 @@ DatasetPartition* generate_distributed_matrix(
         // Load local partition config (this operation could be avoided by conditionally writing in the lines above,
         // but the readability impact is not worth it, might change it still, tho).
         memcpy(&my_data->config, &configs[0], sizeof(PartitionConfig));
+        my_data->config.owned_cols = malloc(my_data->config.n_owned_cols * sizeof(uint32_t));
+        memcpy(my_data->config.owned_cols, configs[0].owned_cols, my_data->config.n_owned_cols * sizeof(uint32_t));
 
         // Transfer data as an array
         uint32_t* config_buffer = malloc((base_size + 2) * sizeof(uint32_t));
@@ -335,46 +336,45 @@ DatasetPartition* generate_distributed_matrix(
             dbg_print("Writing root rows from %u to %u\n", block_start, block_end);
             for (uint32_t j = 0; j < my_data->config.n_owned_cols; j++) {
                 const uint32_t cur_col = my_data->config.owned_cols[j];
-                const size_t col_offset = n * j * sizeof(data_t);
                 // Iterate block rows, copying the elements to each column
                 for (uint32_t k = 0; k < actual_block_size; k++) {
                     const data_t target = work_data[n * k + cur_col];
-                    const size_t cur_offset = col_offset + (block_start + k) * sizeof(data_t);
-                    memcpy(my_data->data + cur_offset, &target, sizeof(data_t));
+                    memcpy(&my_data->data[j * n + block_start + k], &target, sizeof(data_t));
                 }
             }
 
-            // // Write start info in byte form
-            // data_buffer[0] = (uint8_t) (block_start >> 24);
-            // data_buffer[1] = (uint8_t) (block_start >> 16);
-            // data_buffer[2] = (uint8_t) (block_start >> 8);
-            // data_buffer[3] = (uint8_t) (block_start >> 0);
-            // // Write end info in byte form
-            // data_buffer[4] = (uint8_t) (block_end >> 24);
-            // data_buffer[5] = (uint8_t) (block_end >> 16);
-            // data_buffer[6] = (uint8_t) (block_end >> 8);
-            // data_buffer[7] = (uint8_t) (block_end >> 0);
+            // Write start info in byte form
+            data_buffer[0] = (uint8_t) (block_start >> 24);
+            data_buffer[1] = (uint8_t) (block_start >> 16);
+            data_buffer[2] = (uint8_t) (block_start >> 8);
+            data_buffer[3] = (uint8_t) (block_start >> 0);
+            // Write end info in byte form
+            data_buffer[4] = (uint8_t) (block_end >> 24);
+            data_buffer[5] = (uint8_t) (block_end >> 16);
+            data_buffer[6] = (uint8_t) (block_end >> 8);
+            data_buffer[7] = (uint8_t) (block_end >> 0);
             // Send data to each node
             for (uint32_t j = 1; j < cluster_size; j++) {
+                const size_t buffer_prefix_offset = 8;
+                const size_t buffer_point_size = 3;
                 dbg_print("Sending cluster %u rows from %u to %u\n", j, block_start, block_end);
 
-                const size_t data_buffer_offset = 8;
                 // Build node-specific column buffer for current rows
                 for (uint32_t k = 0; k < configs[j].n_owned_cols; k++) {
                     const uint32_t cur_col = configs[j].owned_cols[k];
                     // Iterate block rows
                     for (uint32_t l = 0; l < actual_block_size; l++) {
                         // Memory offset calculation
-                        const size_t cur_offset = data_buffer_offset + (k * actual_block_size + l) * sizeof(data_t);
+                        const size_t offset = buffer_prefix_offset + (k * actual_block_size + l) * sizeof(data_t);
                         const data_t target = work_data[n * l + cur_col];
                         // Copy a point at a time (can be improved by changing the generation to write inside the block
                         // in column major fashion, avoided initially to make it a bit less confusing to the reader, by
                         // doing such it would be possible to copy a whole column block at a time)
-                        memcpy(data_buffer + cur_offset, &target, sizeof(data_t));
+                        memcpy(data_buffer + offset, &target, sizeof(data_t));
                     }
                 }
                 // Send the current block data to it's node
-                MPI_Send(data_buffer, data_buffer_offset + configs[j].n_owned_cols * actual_block_size * sizeof(data_t), MPI_BYTE, j, TAG_DATA, MPI_COMM_WORLD);
+                MPI_Send(data_buffer, buffer_prefix_offset + configs[j].n_owned_cols * actual_block_size * buffer_point_size, MPI_BYTE, j, TAG_DATA, MPI_COMM_WORLD);
             }
         }
 
@@ -460,8 +460,7 @@ DatasetPartition* generate_distributed_matrix(
 
         // Load block data from buffer
         for (uint32_t i = 0; i < my_data->config.n_owned_cols; i++) {
-            const size_t cur_offset = (i * my_data->config.n + block_start) * sizeof(size_t);
-            memcpy(my_data->data + cur_offset, &data_buffer[8], actual_block_size * sizeof(data_t));
+            memcpy(&my_data->data[i * my_data->config.n + block_start] , &data_buffer[8], actual_block_size * sizeof(data_t));
         }
     }
 
