@@ -2,8 +2,11 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <omp.h>
 #include <mpi.h>
+
+// TODO: check for success on every MPI call and malloc
 
 /////////////
 // Configs //
@@ -14,6 +17,9 @@
 
 #define TAG_CONFIG 1
 #define TAG_DATA 2
+#define TAG_COMPUTE_REQUEST 3
+#define TAG_COMPUTE_RESULT 4
+#define TAG_FINAL_RESULT 5
 
 ////////////
 // Macros //
@@ -73,11 +79,37 @@ typedef struct PartitionChunk {
     data_t* data;
 } PartitionChunk;
 
+typedef struct ComputeTargetRequest {
+    uint32_t idx;
+    data_t target;
+} ComputeTargetRequest;
+
+typedef struct ComputeTargetResult {
+    uint32_t idx;
+    data_t target;
+
+    double min_euclidean;
+    double max_euclidean;
+    uint32_t min_manhattan;
+    uint32_t max_manhattan;
+} ComputeTargetResult;
+
+typedef struct ComputeResult {
+    double min_euclidean;
+    double max_euclidean;
+    uint32_t min_manhattan;
+    uint32_t max_manhattan;
+
+    double sum_min_euclidean;
+    double sum_max_euclidean;
+    uint64_t sum_min_manhattan;
+    uint64_t sum_max_manhattan;
+} ComputeResult;
+
 //////////////////
 // Declarations //
 //////////////////
 
-void init_mpi_data();
 void parse_args(int argc, char* argv[], uint32_t* n, uint32_t* seed, uint32_t* thread_count);
 DatasetPartition* generate_distributed_matrix(uint32_t n, uint32_t seed, int cluster_size, int my_rank);
 
@@ -88,7 +120,6 @@ DatasetPartition* generate_distributed_matrix(uint32_t n, uint32_t seed, int clu
 int main(int argc, char* argv[]) {
     // MPI Initialization
     MPI_Init(&argc, &argv);
-    init_mpi_data();
 
     // Cli argument parsing
     uint32_t n;
@@ -96,20 +127,24 @@ int main(int argc, char* argv[]) {
     uint32_t thread_count;
     parse_args(argc, argv, &n, &seed, &thread_count);
 
+    // OpenMP configs
+    omp_set_nested(1);
+    omp_set_num_threads(thread_count);
+
     // Load MPI process information
     int cluster_size;
     int my_rank;
 
     // Load cluster size
     if (MPI_Comm_size(MPI_COMM_WORLD, &cluster_size) != MPI_SUCCESS) {
-        fprintf(stderr, "Failed to retrieve MPI cluster size\n");
+        errprintf("Failed to retrieve MPI cluster size\n");
         MPI_Finalize();
         exit(1);
     }
 
     // Load rank
     if (MPI_Comm_rank(MPI_COMM_WORLD, &my_rank) != MPI_SUCCESS) {
-        fprintf(stderr, "Failed to retrieve instance rank on MPI cluster\n");
+        errprintf("Failed to retrieve instance rank on MPI cluster\n");
         MPI_Finalize();
         exit(1);
     }
@@ -120,10 +155,11 @@ int main(int argc, char* argv[]) {
     // Initialize data across cluster
     DatasetPartition* my_data = generate_distributed_matrix(n, seed, cluster_size, my_rank);
 
-    if (DEBUG) {
+    // Print the current node partition data (when DEBUG is enabled)
+    if (DEBUG == 2) {
         dbg_print("Partition %u data:\n", my_rank);
         for (uint32_t i = 0; i < my_data->config.n_owned_cols; i++) {
-            dbg_print_clean("Column (%u) %u: [", i, my_data->config.owned_cols[i]);
+            dbg_print_clean("[Node %d] Column %u: [", my_rank, my_data->config.owned_cols[i]);
             for (uint32_t j = 0; j < my_data->config.n; j++) {
                 if (j != 0) {
                     dbg_print_clean(", ");
@@ -143,13 +179,6 @@ int main(int argc, char* argv[]) {
 }
 
 /**
- * \brief Initiate global data associated to MPI, such as data types
- */
-void init_mpi_data() {
-
-}
-
-/**
  * \brief Load the program arguments from the CLI args, providing reasonable defaults
  * if not available.
  * \param argc standard argc
@@ -165,7 +194,7 @@ void parse_args(const int argc, char* argv[], uint32_t* n, uint32_t* seed, uint3
         dbg_print("Received CLI arg n=%u\n", *n);
     }
     else {
-        *n = 100;
+        *n = 10;
         dbg_print("Using fallback CLI arg n=%u\n", *n);
     }
 
@@ -205,6 +234,8 @@ DatasetPartition* generate_distributed_matrix(
     const int cluster_size,
     const int my_rank
 ) {
+    const size_t buffer_prefix_offset = 8;
+
     DatasetPartition* my_data = malloc(sizeof(DatasetPartition));
     if (my_data == NULL) {
         errprintf("Failed to alloc local partition data");
@@ -257,19 +288,26 @@ DatasetPartition* generate_distributed_matrix(
         }
 
         // Assign the columns to each node
-        uint32_t node = 0;
+        int32_t node = 0;
         for (uint32_t i = 0; i < n; i++) {
             const uint32_t intra_idx = configs[node].n_owned_cols;
-            dbg_print("Assigned column (%u @ %u) to node %u\n", i, intra_idx, node);
+            if (DEBUG == 2) {
+                dbg_print("Assigned column (%u @ %u) to node %u\n", i, intra_idx, node);
+            }
             configs[node].n_owned_cols++;
             configs[node].owned_cols[intra_idx] = i;
 
             // Alternate iteration order
-            if (i % cluster_size == 0) {
-            } else if (i / cluster_size % 2 == 0) {
-                node++;
-            } else {
-                node--;
+            if (cluster_size != 1) {
+                if (i / cluster_size % 2 == 0) {
+                    if (node != cluster_size - 1) {
+                        node++;
+                    }
+                } else {
+                    if (node != 0) {
+                        node--;
+                    }
+                }
             }
         }
 
@@ -355,8 +393,6 @@ DatasetPartition* generate_distributed_matrix(
             data_buffer[7] = (uint8_t) (block_end >> 0);
             // Send data to each node
             for (uint32_t j = 1; j < cluster_size; j++) {
-                const size_t buffer_prefix_offset = 8;
-                const size_t buffer_point_size = 3;
                 dbg_print("Sending cluster %u rows from %u to %u\n", j, block_start, block_end);
 
                 // Build node-specific column buffer for current rows
@@ -374,7 +410,7 @@ DatasetPartition* generate_distributed_matrix(
                     }
                 }
                 // Send the current block data to it's node
-                MPI_Send(data_buffer, buffer_prefix_offset + configs[j].n_owned_cols * actual_block_size * buffer_point_size, MPI_BYTE, j, TAG_DATA, MPI_COMM_WORLD);
+                MPI_Send(data_buffer, buffer_prefix_offset + configs[j].n_owned_cols * actual_block_size * sizeof(data_t), MPI_BYTE, j, TAG_DATA, MPI_COMM_WORLD);
             }
         }
 
@@ -419,6 +455,18 @@ DatasetPartition* generate_distributed_matrix(
 
     memcpy(my_data->config.owned_cols, &config_buffer[2], sizeof(uint32_t) * my_data->config.n_owned_cols);
 
+    if (DEBUG) {
+        dbg_print("I'm node %d and received the configs: n=%u n_owned_cols=%u\n", my_rank, my_data->config.n, my_data->config.n_owned_cols);
+        dbg_print_clean("owned_cols=[");
+        for (uint32_t i = 0; i < my_data->config.n_owned_cols; i++) {
+            if (i != 0) {
+                dbg_print_clean(", ");
+            }
+            dbg_print_clean("%u", my_data->config.owned_cols[i]);
+        }
+        dbg_print_clean("]\n");
+    }
+
     // Allocate my data partition
     my_data->data = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
     if (my_data->data == NULL) {
@@ -445,26 +493,74 @@ DatasetPartition* generate_distributed_matrix(
         MPI_Recv(data_buffer, data_size, MPI_BYTE, 0, TAG_DATA, MPI_COMM_WORLD, &data_status);
 
         // Parse block boundaries
-        const uint32_t block_start = (uint32_t) data_buffer[0] << 24
-                                + (uint32_t) data_buffer[1] << 16
-                                + (uint32_t) data_buffer[2] << 8
-                                + (uint32_t) data_buffer[3] << 0;
-        const uint32_t block_end = (uint32_t) data_buffer[4] << 24
-                                + (uint32_t) data_buffer[5] << 16
-                                + (uint32_t) data_buffer[6] << 8
-                                + (uint32_t) data_buffer[7] << 0;
+        const uint32_t block_start = ((uint32_t) data_buffer[0] << 24)
+                                + ((uint32_t) data_buffer[1] << 16)
+                                + ((uint32_t) data_buffer[2] << 8)
+                                + ((uint32_t) data_buffer[3] << 0);
+        const uint32_t block_end = ((uint32_t) data_buffer[4] << 24)
+                                + ((uint32_t) data_buffer[5] << 16)
+                                + ((uint32_t) data_buffer[6] << 8)
+                                + ((uint32_t) data_buffer[7] << 0);
         const uint32_t actual_block_size = block_end - block_start + 1;
         received_rows += actual_block_size;
 
-        dbg_print("Receiving rows from %u to %u\n", block_start, block_end);
+        dbg_print("[Node %d] Receiving rows from %u to %u\n", my_rank, block_start, block_end);
 
         // Load block data from buffer
         for (uint32_t i = 0; i < my_data->config.n_owned_cols; i++) {
-            memcpy(&my_data->data[i * my_data->config.n + block_start] , &data_buffer[8], actual_block_size * sizeof(data_t));
+            const size_t data_offset = i * my_data->config.n + block_start;
+            const size_t buffer_offset = buffer_prefix_offset + i * actual_block_size * sizeof(data_t);
+            memcpy(my_data->data + data_offset, data_buffer + buffer_offset, actual_block_size * sizeof(data_t));
         }
     }
 
     free(data_buffer);
     free(config_buffer);
     return my_data;
+}
+
+ComputeResult compute(
+    DatasetPartition* data,
+    int my_rank,
+    int cluster_size
+) {
+    ComputeResult result = {
+        .min_euclidean = INFINITY,
+        .max_euclidean = -INFINITY,
+        .min_manhattan = UINT32_MAX,
+        .max_manhattan = 0,
+
+        .sum_min_euclidean = 0,
+        .sum_max_euclidean = 0,
+        .sum_min_manhattan = 0,
+        .sum_max_manhattan = 0
+    };
+
+    // Maybe dont return the compute results for each request, letting each node hold a full reduction and only returning once
+    // It's possible to prevent the extra allocation of memory to this buffer by pre-allocating it in the partition itself.
+    ComputeTargetRequest* compute_requests_buffer = malloc(data->config.n * data->config.n_owned_cols * sizeof(ComputeTargetRequest));
+
+    // Initialize send buffers array
+    // Compute local to local values
+    // Dispatch non-blocking batch computation for every node
+    // Gather results
+    // Reduce everything on primary
+
+
+}
+
+ComputeResult compute_local(
+    DatasetPartition* data,
+    int my_rank,
+    int cluster_size
+) {
+
+}
+
+ComputeResult compute_remote(
+    DatasetPartition* data,
+    int my_rank,
+    int cluster_size
+) {
+
 }
