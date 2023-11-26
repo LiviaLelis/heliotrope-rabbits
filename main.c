@@ -54,11 +54,7 @@ fprintf(stderr, fmt, ##__VA_ARGS__); \
 
 // Since the value ranges from 0 to 99 an 8 bit int will be just enough. Using a signed to avoid accidental overflows
 // while doing calculations, even though casts will be needed anyways.
-typedef struct Point {
-    int8_t x, y, z;
-} Point;
-
-typedef Point data_t;
+typedef int8_t data_t;
 
 typedef struct PartitionConfig {
     uint32_t n;
@@ -70,7 +66,10 @@ typedef struct DatasetPartition {
     PartitionConfig config;
     // The data is represented in column major fashion, that is, an entire column in sequence
     // as this will be more useful for handling cache coherence and even work distribution
-    data_t* data;
+    // Use SoA for better SIMD usage
+    data_t* x;
+    data_t* y;
+    data_t* z;
 } DatasetPartition;
 
 typedef struct PartitionChunk {
@@ -164,8 +163,8 @@ int main(int argc, char* argv[]) {
                 if (j != 0) {
                     dbg_print_clean(", ");
                 }
-                const Point p = my_data->data[i * my_data->config.n + j];
-                dbg_print_clean("(%u, %u, %u)", p.x, p.y, p.z);
+                const size_t idx = i * my_data->config.n + j;
+                dbg_print_clean("(%u, %u, %u)", my_data->x[idx], my_data->y[idx], my_data->z[idx]);
             }
             dbg_print_clean("]\n");
         }
@@ -173,7 +172,9 @@ int main(int argc, char* argv[]) {
 
     // MPI Finishing & Cleanup
     MPI_Finalize();
-    free(my_data->data);
+    free(my_data->x);
+    free(my_data->y);
+    free(my_data->z);
     free(my_data);
     return 0;
 }
@@ -335,10 +336,24 @@ DatasetPartition* generate_distributed_matrix(
             MPI_Send(config_buffer, configs[i].n_owned_cols + 2, MPI_UNSIGNED, i, TAG_CONFIG, MPI_COMM_WORLD);
         }
 
-        // Allocate my data partition
-        my_data->data = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
-        if (my_data->data == NULL) {
-            errprintf("Failed to alloc local data partition (matrix generation)");
+        // Allocate my x partition
+        my_data->x = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
+        if (my_data->x == NULL) {
+            errprintf("Failed to alloc local x partition (matrix generation)");
+            exit(1);
+        }
+
+        // Allocate my y partition
+        my_data->y = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
+        if (my_data->y == NULL) {
+            errprintf("Failed to alloc local y partition (matrix generation)");
+            exit(1);
+        }
+
+        // Allocate my z partition
+        my_data->z = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
+        if (my_data->z == NULL) {
+            errprintf("Failed to alloc local z partition (matrix generation)");
             exit(1);
         }
 
@@ -352,65 +367,63 @@ DatasetPartition* generate_distributed_matrix(
             exit(1);
         }
 
+        data_t* my_dests[] = {
+            my_data->x,
+            my_data->y,
+            my_data->z
+        };
+
         // Generate & send blocks
-        for (uint32_t i = 0; i < block_count; i++) {
-            const uint32_t block_start = i * BLOCK_SIZE;
-            const uint32_t block_end =  (n < block_start + BLOCK_SIZE ? n : block_start + BLOCK_SIZE) - 1;
-            const uint32_t actual_block_size = block_end - block_start + 1;
+        for (uint8_t o = 0; o < 3; o++) {
+            for (uint32_t i = 0; i < block_count; i++) {
+                const uint32_t block_start = i * BLOCK_SIZE;
+                const uint32_t block_end =  (n < block_start + BLOCK_SIZE ? n : block_start + BLOCK_SIZE) - 1;
+                const uint32_t actual_block_size = block_end - block_start + 1;
 
-            for (uint32_t j = 0; j < actual_block_size; j++) {
-                // Generate full row
-                for (uint32_t k = 0; k < n; k++) {
-                    // This RNG won't really be uniform due to rand's range being between 0 to 2147483647
-                    work_data[j * n + k] = (Point){
-                        .x = rand() % 100,
-                        .y = rand() % 100,
-                        .z = rand() % 100
-                    };
-                }
-            }
-
-            // Handle root
-            dbg_print("Writing root rows from %u to %u\n", block_start, block_end);
-            for (uint32_t j = 0; j < my_data->config.n_owned_cols; j++) {
-                const uint32_t cur_col = my_data->config.owned_cols[j];
-                // Iterate block rows, copying the elements to each column
-                for (uint32_t k = 0; k < actual_block_size; k++) {
-                    const data_t target = work_data[n * k + cur_col];
-                    memcpy(&my_data->data[j * n + block_start + k], &target, sizeof(data_t));
-                }
-            }
-
-            // Write start info in byte form
-            data_buffer[0] = (uint8_t) (block_start >> 24);
-            data_buffer[1] = (uint8_t) (block_start >> 16);
-            data_buffer[2] = (uint8_t) (block_start >> 8);
-            data_buffer[3] = (uint8_t) (block_start >> 0);
-            // Write end info in byte form
-            data_buffer[4] = (uint8_t) (block_end >> 24);
-            data_buffer[5] = (uint8_t) (block_end >> 16);
-            data_buffer[6] = (uint8_t) (block_end >> 8);
-            data_buffer[7] = (uint8_t) (block_end >> 0);
-            // Send data to each node
-            for (uint32_t j = 1; j < cluster_size; j++) {
-                dbg_print("Sending cluster %u rows from %u to %u\n", j, block_start, block_end);
-
-                // Build node-specific column buffer for current rows
-                for (uint32_t k = 0; k < configs[j].n_owned_cols; k++) {
-                    const uint32_t cur_col = configs[j].owned_cols[k];
-                    // Iterate block rows
-                    for (uint32_t l = 0; l < actual_block_size; l++) {
-                        // Memory offset calculation
-                        const size_t offset = buffer_prefix_offset + (k * actual_block_size + l) * sizeof(data_t);
-                        const data_t target = work_data[n * l + cur_col];
-                        // Copy a point at a time (can be improved by changing the generation to write inside the block
-                        // in column major fashion, avoided initially to make it a bit less confusing to the reader, by
-                        // doing such it would be possible to copy a whole column block at a time)
-                        memcpy(data_buffer + offset, &target, sizeof(data_t));
+                for (uint32_t j = 0; j < actual_block_size; j++) {
+                    // Generate full row
+                    for (uint32_t k = 0; k < n; k++) {
+                        // This RNG won't really be uniform due to rand's range being between 0 to 2147483647
+                        work_data[k * n + j] = rand() % 100;
                     }
                 }
-                // Send the current block data to it's node
-                MPI_Send(data_buffer, buffer_prefix_offset + configs[j].n_owned_cols * actual_block_size * sizeof(data_t), MPI_BYTE, j, TAG_DATA, MPI_COMM_WORLD);
+
+                // Handle root
+                dbg_print("Writing root rows from %u to %u\n", block_start, block_end);
+                for (uint32_t j = 0; j < my_data->config.n_owned_cols; j++) {
+                    const uint32_t cur_col = my_data->config.owned_cols[j];
+                    // Iterate block rows, copying the elements to each column
+                    const size_t dest_offset = j * n + block_start;
+                    const size_t src_offset= n * cur_col;
+                    memcpy(my_dests[o] + dest_offset, work_data + src_offset, actual_block_size * sizeof(data_t));
+                }
+
+                // Write start info in byte form
+                data_buffer[0] = (uint8_t) (block_start >> 24);
+                data_buffer[1] = (uint8_t) (block_start >> 16);
+                data_buffer[2] = (uint8_t) (block_start >> 8);
+                data_buffer[3] = (uint8_t) (block_start >> 0);
+                // Write end info in byte form
+                data_buffer[4] = (uint8_t) (block_end >> 24);
+                data_buffer[5] = (uint8_t) (block_end >> 16);
+                data_buffer[6] = (uint8_t) (block_end >> 8);
+                data_buffer[7] = (uint8_t) (block_end >> 0);
+                // Send data to each node
+                for (uint32_t j = 1; j < cluster_size; j++) {
+                    dbg_print("Sending cluster %u rows from %u to %u\n", j, block_start, block_end);
+
+                    // Build node-specific column buffer for current rows
+                    for (uint32_t k = 0; k < configs[j].n_owned_cols; k++) {
+                        // Memory offset calculation
+                        const uint32_t cur_col = configs[j].owned_cols[k];
+                        const size_t dest_offset = buffer_prefix_offset + (k * actual_block_size) * sizeof(data_t);
+                        const size_t src_offset = n * cur_col;
+                        // Copy all the rows of column at a time
+                        memcpy(data_buffer + dest_offset, work_data + src_offset, actual_block_size * sizeof(data_t));
+                    }
+                    // Send the current block data to it's node
+                    MPI_Send(data_buffer, buffer_prefix_offset + configs[j].n_owned_cols * actual_block_size * sizeof(data_t), MPI_BYTE, j, TAG_DATA, MPI_COMM_WORLD);
+                }
             }
         }
 
@@ -467,12 +480,33 @@ DatasetPartition* generate_distributed_matrix(
         dbg_print_clean("]\n");
     }
 
-    // Allocate my data partition
-    my_data->data = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
-    if (my_data->data == NULL) {
-        errprintf("Failed to alloc local data partition (matrix generation)");
+    // Allocate my x partition
+    my_data->x = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
+    if (my_data->x == NULL) {
+        errprintf("Failed to alloc local x partition (matrix generation)");
         exit(1);
     }
+
+    // Allocate my y partition
+    my_data->y = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
+    if (my_data->y == NULL) {
+        errprintf("Failed to alloc local y partition (matrix generation)");
+        exit(1);
+    }
+
+    // Allocate my z partition
+    my_data->z = malloc(my_data->config.n * my_data->config.n_owned_cols * sizeof(data_t));
+    if (my_data->z == NULL) {
+        errprintf("Failed to alloc local z partition (matrix generation)");
+        exit(1);
+    }
+
+    // Utility for looping
+    data_t* my_dests[] = {
+        my_data->x,
+        my_data->y,
+        my_data->z
+    };
 
     // Receive this partition's data
     MPI_Status data_status;
@@ -482,35 +516,37 @@ DatasetPartition* generate_distributed_matrix(
         errprintf("Failed to alloc data buffer for MPI transfer (matrix generation)");
         exit(1);
     }
-    uint32_t received_rows = 0;
 
-    while (received_rows < n) {
-        // Wait for message data
-        MPI_Probe(0, TAG_DATA, MPI_COMM_WORLD, &data_status);
-        MPI_Get_count(&data_status, MPI_BYTE, &data_size);
+    for (uint8_t o = 0; o < 3; o++) {
+        uint32_t received_rows = 0;
+        while (received_rows < n) {
+            // Wait for message data
+            MPI_Probe(0, TAG_DATA, MPI_COMM_WORLD, &data_status);
+            MPI_Get_count(&data_status, MPI_BYTE, &data_size);
 
-        // Receive it
-        MPI_Recv(data_buffer, data_size, MPI_BYTE, 0, TAG_DATA, MPI_COMM_WORLD, &data_status);
+            // Receive it
+            MPI_Recv(data_buffer, data_size, MPI_BYTE, 0, TAG_DATA, MPI_COMM_WORLD, &data_status);
 
-        // Parse block boundaries
-        const uint32_t block_start = ((uint32_t) data_buffer[0] << 24)
-                                + ((uint32_t) data_buffer[1] << 16)
-                                + ((uint32_t) data_buffer[2] << 8)
-                                + ((uint32_t) data_buffer[3] << 0);
-        const uint32_t block_end = ((uint32_t) data_buffer[4] << 24)
-                                + ((uint32_t) data_buffer[5] << 16)
-                                + ((uint32_t) data_buffer[6] << 8)
-                                + ((uint32_t) data_buffer[7] << 0);
-        const uint32_t actual_block_size = block_end - block_start + 1;
-        received_rows += actual_block_size;
+            // Parse block boundaries
+            const uint32_t block_start = ((uint32_t) data_buffer[0] << 24)
+                                    + ((uint32_t) data_buffer[1] << 16)
+                                    + ((uint32_t) data_buffer[2] << 8)
+                                    + ((uint32_t) data_buffer[3] << 0);
+            const uint32_t block_end = ((uint32_t) data_buffer[4] << 24)
+                                    + ((uint32_t) data_buffer[5] << 16)
+                                    + ((uint32_t) data_buffer[6] << 8)
+                                    + ((uint32_t) data_buffer[7] << 0);
+            const uint32_t actual_block_size = block_end - block_start + 1;
+            received_rows += actual_block_size;
 
-        dbg_print("[Node %d] Receiving rows from %u to %u\n", my_rank, block_start, block_end);
+            dbg_print("[Node %d] Receiving rows[%u] from %u to %u\n", my_rank, (uint32_t) o, block_start, block_end);
 
-        // Load block data from buffer
-        for (uint32_t i = 0; i < my_data->config.n_owned_cols; i++) {
-            const size_t data_offset = i * my_data->config.n + block_start;
-            const size_t buffer_offset = buffer_prefix_offset + i * actual_block_size * sizeof(data_t);
-            memcpy(my_data->data + data_offset, data_buffer + buffer_offset, actual_block_size * sizeof(data_t));
+            // Load block data from buffer
+            for (uint32_t i = 0; i < my_data->config.n_owned_cols; i++) {
+                const size_t data_offset = i * my_data->config.n + block_start;
+                const size_t buffer_offset = buffer_prefix_offset + i * actual_block_size * sizeof(data_t);
+                memcpy(my_dests[o] + data_offset, data_buffer + buffer_offset, actual_block_size * sizeof(data_t));
+            }
         }
     }
 
