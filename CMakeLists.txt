@@ -3,8 +3,8 @@ project(HeliotropeRabbits C)
 
 # Use C17 standard
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_FLAGS_DEBUG_INIT "-Wall -g -fsanitize=unknown -fsanitize=address -lm")
-set(CMAKE_CXX_FLAGS_RELEASE_INIT "-Wall -O2 -lm")
+set(CMAKE_CXX_FLAGS_DEBUG_INIT "-Wall -g -fsanitize=unknown -fsanitize=address -O2 -lm -fopenmp -fopt-info -march=native")
+set(CMAKE_CXX_FLAGS_RELEASE_INIT "-Wall -O3 -lm -fopenmp -fopt-info -march=native")
 
 # Main Program
 add_executable(HeliotropeRabbits main.c)

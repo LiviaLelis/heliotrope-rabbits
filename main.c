@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <math.h>
 #include <omp.h>
 #include <mpi.h>
 
@@ -48,6 +47,8 @@ fprintf(stderr, fmt, ##__VA_ARGS__); \
 
 #define errprintf(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__)
 
+#define INFINITY (1.0 / 0.0)
+
 /////////////////////
 // Types & Structs //
 /////////////////////
@@ -80,27 +81,39 @@ typedef struct PartitionChunk {
 
 typedef struct ComputeTargetRequest {
     uint32_t idx;
-    data_t target;
+    data_t x;
+    data_t y;
+    data_t z;
 } ComputeTargetRequest;
 
+// Keep all the euclideans squared, as we can calculate the SQRT only once at the end
 typedef struct ComputeTargetResult {
     uint32_t idx;
-    data_t target;
+    data_t x;
+    data_t y;
+    data_t z;
 
-    double min_euclidean;
-    double max_euclidean;
+    uint32_t min_euclidean;
+    uint32_t max_euclidean;
     uint32_t min_manhattan;
     uint32_t max_manhattan;
 } ComputeTargetResult;
 
+typedef struct ComputeTargetResultLocal {
+    uint32_t min_euclidean;
+    uint32_t max_euclidean;
+    uint32_t min_manhattan;
+    uint32_t max_manhattan;
+} ComputeTargetResultLocal;
+
 typedef struct ComputeResult {
-    double min_euclidean;
-    double max_euclidean;
+    uint32_t min_euclidean;
+    uint32_t max_euclidean;
     uint32_t min_manhattan;
     uint32_t max_manhattan;
 
-    double sum_min_euclidean;
-    double sum_max_euclidean;
+    uint64_t sum_min_euclidean;
+    uint64_t sum_max_euclidean;
     uint64_t sum_min_manhattan;
     uint64_t sum_max_manhattan;
 } ComputeResult;
@@ -111,6 +124,8 @@ typedef struct ComputeResult {
 
 void parse_args(int argc, char* argv[], uint32_t* n, uint32_t* seed, uint32_t* thread_count);
 DatasetPartition* generate_distributed_matrix(uint32_t n, uint32_t seed, int cluster_size, int my_rank);
+ComputeResult compute(const DatasetPartition* data, int my_rank, int cluster_size);
+void compute_point(const DatasetPartition* data, ComputeTargetResult* target_result);
 
 //////////
 // Impl //
@@ -169,6 +184,8 @@ int main(int argc, char* argv[]) {
             dbg_print_clean("]\n");
         }
     }
+
+    compute(my_data, my_rank, cluster_size);
 
     // MPI Finishing & Cleanup
     MPI_Finalize();
@@ -556,7 +573,7 @@ DatasetPartition* generate_distributed_matrix(
 }
 
 ComputeResult compute(
-    DatasetPartition* data,
+    const DatasetPartition* data,
     int my_rank,
     int cluster_size
 ) {
@@ -572,17 +589,105 @@ ComputeResult compute(
         .sum_max_manhattan = 0
     };
 
-    // Maybe dont return the compute results for each request, letting each node hold a full reduction and only returning once
-    // It's possible to prevent the extra allocation of memory to this buffer by pre-allocating it in the partition itself.
-    ComputeTargetRequest* compute_requests_buffer = malloc(data->config.n * data->config.n_owned_cols * sizeof(ComputeTargetRequest));
+    // Request/Response data
+    const size_t full_size = data->config.n * data->config.n_owned_cols;
+    ComputeTargetRequest* requests_buffer = malloc(full_size * sizeof(ComputeTargetRequest));
+    ComputeTargetResultLocal* local_results = malloc(full_size * sizeof(ComputeTargetResultLocal));
+    uint32_t received = 0;
 
-    // Initialize send buffers array
-    // Compute local to local values
-    // Dispatch non-blocking batch computation for every node
-    // Gather results
-    // Reduce everything on primary
+    // Initialize the data
+    // TODO: OMP here (SIMD + parallel for)
+    for (size_t i = 0; i < full_size; i++) {
+        const uint32_t row = i % data->config.n;
+        const uint32_t col = data->config.owned_cols[i / data->config.n];
+        const uint32_t global_idx = col * data->config.n + row;
+
+        requests_buffer[i] = (ComputeTargetRequest){
+            .idx = global_idx,
+            .x = data->x[i],
+            .y = data->y[i],
+            .z = data->z[i],
+        };
+
+        local_results[i] = (ComputeTargetResultLocal){
+            .min_euclidean = INFINITY,
+            .max_euclidean = -INFINITY,
+            .min_manhattan = UINT32_MAX,
+            .max_manhattan =  0
+        };
+    }
+
+    ComputeTargetResult example = {
+        31,
+        12,
+        4,
+        82,
+        UINT32_MAX,
+        0,
+        UINT32_MAX,
+        0
+    };
+
+    compute_point(data, &example);
 
 
+    // Task 1: Compute local values
+    // Task 2: Send remote computes
+    // Task 3: Receive remote computes
+
+    // Reduce everything
+    // Send to primary
+
+
+    free(requests_buffer);
+    free(local_results);
+    return result;
+}
+
+// Fast, branch-less, ABS calculation for integers
+// Src: https://graphics.stanford.edu/~seander/bithacks.html#IntegerAbs
+static uint8_t fast_abs(const int8_t v) {
+    const uint8_t mask = v >> 7;
+    return (v + mask) ^ mask;
+}
+
+void compute_point(
+    const DatasetPartition* data,
+    ComputeTargetResult* target_result
+) {
+    const uint32_t target_row = target_result->idx % data->config.n;
+    const uint32_t target_col = target_result->idx / data->config.n;
+
+    // Run a loop for each column. Could be paralelized, but there is not much benefit into it, since it's better to
+    // paralelize the call to this entire function for each point.
+    for (uint32_t i = 0; i < data->config.n_owned_cols; i++) {
+        const uint32_t col = data->config.owned_cols[i];
+        const size_t col_offset = data->config.n * i;
+        const uint32_t st_row = target_row + (col < target_col ? 1 : 0);
+
+        #pragma omp for simd
+        for (uint32_t j = st_row; j < data->config.n; j++) {
+            // SIMD-able block
+            const int8_t xd = target_result->x - data->x[col_offset + j];
+            const int8_t yd = target_result->y - data->y[col_offset + j];
+            const int8_t zd = target_result->z - data->z[col_offset + j];
+
+            // SIMD-able block
+            const uint8_t axd = fast_abs(xd);
+            const uint8_t ayd = fast_abs(yd);
+            const uint8_t azd = fast_abs(zd);
+
+            // Manhattan
+            const uint32_t manhattan = (uint32_t) axd + ayd + azd;
+            target_result->min_manhattan = (manhattan < target_result->min_manhattan) ? manhattan : target_result->min_manhattan;
+            target_result->max_manhattan = (manhattan < target_result->max_manhattan) ? manhattan : target_result->max_manhattan;
+
+            // Euclidean
+            const uint32_t euclidean = (uint32_t) axd * axd + (uint32_t) ayd * ayd + (uint32_t) azd * azd;
+            target_result->min_euclidean = (euclidean < target_result->min_euclidean) ? euclidean : target_result->min_euclidean;
+            target_result->max_euclidean = (euclidean < target_result->max_euclidean) ? euclidean : target_result->max_euclidean;
+        }
+    }
 }
 
 ComputeResult compute_local(
