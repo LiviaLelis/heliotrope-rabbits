@@ -10,7 +10,7 @@
 /////////////
 
 #define BLOCK_SIZE 32
-#define DEBUG 0
+#define DEBUG 1
 
 #define TAG_CONFIG 1
 #define TAG_DATA 2
@@ -308,7 +308,7 @@ DatasetPartition* generate_distributed_matrix(
 
         // Allocate buffer for data sending
         uint8_t* data_buffer = malloc(base_size * n * sizeof(data_t) + 2  * sizeof(uint32_t));
-        if (my_data->data == NULL) {
+        if (data_buffer == NULL) {
             errprintf("Failed to alloc data buffer for MPI transfer (matrix generation)");
             exit(1);
         }
@@ -344,16 +344,16 @@ DatasetPartition* generate_distributed_matrix(
                 }
             }
 
-            // Write start info in byte form
-            data_buffer[0] = (uint8_t) (block_start >> 24);
-            data_buffer[1] = (uint8_t) (block_start >> 16);
-            data_buffer[2] = (uint8_t) (block_start >> 8);
-            data_buffer[3] = (uint8_t) (block_start >> 0);
-            // Write end info in byte form
-            data_buffer[4] = (uint8_t) (block_end >> 24);
-            data_buffer[5] = (uint8_t) (block_end >> 16);
-            data_buffer[6] = (uint8_t) (block_end >> 8);
-            data_buffer[7] = (uint8_t) (block_end >> 0);
+            // // Write start info in byte form
+            // data_buffer[0] = (uint8_t) (block_start >> 24);
+            // data_buffer[1] = (uint8_t) (block_start >> 16);
+            // data_buffer[2] = (uint8_t) (block_start >> 8);
+            // data_buffer[3] = (uint8_t) (block_start >> 0);
+            // // Write end info in byte form
+            // data_buffer[4] = (uint8_t) (block_end >> 24);
+            // data_buffer[5] = (uint8_t) (block_end >> 16);
+            // data_buffer[6] = (uint8_t) (block_end >> 8);
+            // data_buffer[7] = (uint8_t) (block_end >> 0);
             // Send data to each node
             for (uint32_t j = 1; j < cluster_size; j++) {
                 dbg_print("Sending cluster %u rows from %u to %u\n", j, block_start, block_end);
