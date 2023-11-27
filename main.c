@@ -856,7 +856,7 @@ ComputeResult compute(
         }
 
         // Wait for everyone
-        MPI_Barrier(MPI_COMM_WORLD);
+        // MPI_Barrier(MPI_COMM_WORLD);
     }
 
 
