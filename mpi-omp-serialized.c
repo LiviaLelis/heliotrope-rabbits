@@ -11,8 +11,8 @@
 // Configs //
 /////////////
 
-#define BATCH_SIZE 32
-#define BLOCK_SIZE 256
+#define glb_batch_size 32
+#define glb_block_size 256
 #define DEBUG 0
 #define WAIT_ATTACH 0
 
@@ -202,13 +202,19 @@ int main(int argc, char* argv[]) {
     // Load cluster size
     mpi_check(MPI_Comm_size(MPI_COMM_WORLD, &cluster_size));
 
+    // Cap the number of nodes to n
     if (cluster_size > n) {
-        fprintf(stderr, "Cluster size must be smaller then N\n");
-        exit(1);
+        cluster_size = (int) n;
     }
 
     // Load rank
     mpi_check(MPI_Comm_rank(MPI_COMM_WORLD, &my_rank));
+
+    // Exit if no computation is needed from this cluster member
+    if (my_rank >= n) {
+        MPI_Finalize();
+        return 0;
+    }
 
     // Debug process info
     dbg_print("Initialized process on MPI Cluster! Cluster size: %d; My rank: %d\n", cluster_size, my_rank);
@@ -318,7 +324,7 @@ DatasetPartition* generate_distributed_matrix(
 
         // Currently generating block (since, theoretically, not all data can be held by a single node)
         // Represented in row major fashion to suit the problem requirements
-        data_t* work_data = malloc(n * BLOCK_SIZE * sizeof(data_t));
+        data_t* work_data = malloc(n * glb_block_size * sizeof(data_t));
         malloc_check(work_data);
 
         // Configuration for each node
@@ -404,7 +410,7 @@ DatasetPartition* generate_distributed_matrix(
         malloc_check(my_data->z);
 
         // Number of blocks to be sent
-        const uint32_t block_count = (n - 1) / BLOCK_SIZE + 1;
+        const uint32_t block_count = (n - 1) / glb_block_size + 1;
 
         // Allocate buffer for data sending
         uint8_t* data_buffer = malloc(base_size * n * sizeof(data_t) + 2  * sizeof(uint32_t));
@@ -419,8 +425,8 @@ DatasetPartition* generate_distributed_matrix(
         // Generate & send blocks
         for (uint8_t o = 0; o < 3; o++) {
             for (uint32_t i = 0; i < block_count; i++) {
-                const uint32_t block_start = i * BLOCK_SIZE;
-                const uint32_t block_end =  (n < block_start + BLOCK_SIZE ? n : block_start + BLOCK_SIZE) - 1;
+                const uint32_t block_start = i * glb_block_size;
+                const uint32_t block_end = (n < block_start + glb_block_size ? n : block_start + glb_block_size) - 1;
                 const uint32_t actual_block_size = block_end - block_start + 1;
 
                 for (uint32_t j = 0; j < actual_block_size; j++) {
@@ -539,7 +545,7 @@ DatasetPartition* generate_distributed_matrix(
     // Receive this partition's data
     MPI_Status data_status;
     int32_t data_size;
-    uint8_t* data_buffer = malloc(sizeof(uint32_t) * 2 + BLOCK_SIZE * my_data->config.n_owned_cols * sizeof(data_t));
+    uint8_t* data_buffer = malloc(sizeof(uint32_t) * 2 + glb_block_size * my_data->config.n_owned_cols * sizeof(data_t));
     malloc_check(data_buffer);
 
     for (uint8_t o = 0; o < 3; o++) {
@@ -600,29 +606,29 @@ ComputeResult compute(
 
     // Request/Response data
     const size_t full_size = data->config.n * data->config.n_owned_cols;
-    const uint32_t block_count = (full_size - 1) / BLOCK_SIZE + 1;
-    const uint32_t batch_count = (block_count - 1) / BATCH_SIZE + 1;
+    const uint32_t block_count = (full_size - 1) / glb_block_size + 1;
+    const uint32_t batch_count = (block_count - 1) / glb_batch_size + 1;
 
     // Represent every request as two integers: the index + the x,y,z coords packed in a single 32 bit integer
     const size_t request_size = 2 * sizeof(uint32_t);
-    uint32_t* requests_buffer = malloc(smin(BATCH_SIZE * BLOCK_SIZE, full_size) * request_size);
+    uint32_t* requests_buffer = malloc(smin(glb_batch_size * glb_block_size, full_size) * request_size);
     malloc_check(requests_buffer);
 
     // Represent every response as 4 32-bit integers (min_euc, max_euc, min_man, max_man)
     const size_t response_size = 4 * sizeof(uint32_t);
-    uint32_t* response_buffer = malloc(cluster_size * smin(BATCH_SIZE * BLOCK_SIZE, full_size) * response_size);
+    uint32_t* response_buffer = malloc(cluster_size * smin(glb_batch_size * glb_block_size, full_size) * response_size);
     malloc_check(response_buffer);
 
-    ComputeTargetResultLocal* results = malloc(smin(BATCH_SIZE * BLOCK_SIZE, full_size) * sizeof(ComputeTargetResultLocal));
+    ComputeTargetResultLocal* results = malloc(smin(glb_batch_size * glb_block_size, full_size) * sizeof(ComputeTargetResultLocal));
     malloc_check(results);
-    ComputeTargetResultLocal* my_results = malloc(smin(BATCH_SIZE * BLOCK_SIZE, full_size) * sizeof(ComputeTargetResultLocal));
+    ComputeTargetResultLocal* my_results = malloc(smin(glb_batch_size * glb_block_size, full_size) * sizeof(ComputeTargetResultLocal));
     malloc_check(my_results);
     uint32_t* expected_blocks = calloc(cluster_size, sizeof(uint32_t));
     uint32_t* received = calloc(cluster_size, sizeof(uint32_t));
 
     MPI_Request send_handshake[cluster_size];
-    MPI_Request sends[cluster_size][smin(BATCH_SIZE, block_count)];
-    MPI_Request receives[cluster_size][smin(BATCH_SIZE, block_count)];
+    MPI_Request sends[cluster_size][smin(glb_batch_size, block_count)];
+    MPI_Request receives[cluster_size][smin(glb_batch_size, block_count)];
 
     // Handle the process in batches, in order to limit memory for cases where N^2 doesn't fit memory.
     // This process induces sincronization and, because of that, degrades performance. The bigger BATCH_SIZE
@@ -631,15 +637,15 @@ ComputeResult compute(
     for (uint32_t batch_n = 0; batch_n < batch_count; batch_n++) {
         dbg_print("[Node %d] Computing batch %u\n", my_rank, batch_n);
         // Compute offsets
-        const size_t batch_offset_block = BATCH_SIZE * batch_n;
-        const size_t batch_offset = BLOCK_SIZE * batch_offset_block;
+        const size_t batch_offset_block = glb_batch_size * batch_n;
+        const size_t batch_offset = glb_block_size * batch_offset_block;
 
-        const uint32_t batch_start_block = batch_n * BATCH_SIZE;
-        const uint32_t batch_end_block = (batch_start_block + BATCH_SIZE > block_count ? block_count : batch_start_block + BATCH_SIZE) - 1;
+        const uint32_t batch_start_block = batch_n * glb_batch_size;
+        const uint32_t batch_end_block = (batch_start_block + glb_batch_size > block_count ? block_count : batch_start_block + glb_batch_size) - 1;
         const uint32_t batch_block_count = batch_end_block - batch_start_block + 1;
 
-        const uint32_t batch_start = batch_n * BATCH_SIZE * BLOCK_SIZE;
-        const uint32_t batch_end = ((batch_n + 1) * BATCH_SIZE * BLOCK_SIZE > full_size ? full_size : (batch_n + 1) * BATCH_SIZE * BLOCK_SIZE) - 1;
+        const uint32_t batch_start = batch_n * glb_batch_size * glb_block_size;
+        const uint32_t batch_end = ((batch_n + 1) * glb_batch_size * glb_block_size > full_size ? full_size : (batch_n + 1) * glb_batch_size * glb_block_size) - 1;
         const uint32_t batch_size = batch_end - batch_start + 1;
 
         // Parallel region
@@ -685,23 +691,23 @@ ComputeResult compute(
             {
                 // Data dependency here makes parallelization unfeasable
                 // Send/Receive computation results
-                for (uint32_t i = 0; i < batch_size; i+= BLOCK_SIZE) {
+                for (uint32_t i = 0; i < batch_size; i+= glb_block_size) {
                     const uint32_t block_start = i;
-                    const uint32_t block_end = (i + BLOCK_SIZE > batch_size ? batch_size : i + BLOCK_SIZE) - 1;
+                    const uint32_t block_end = (i + glb_block_size > batch_size ? batch_size : i + glb_block_size) - 1;
                     const uint32_t actual_size =  block_end - block_start + 1;
 
                     // Do the send/receive pair for each node, avoiding the need for sincronization through the use of non-blocking
                     // calls.
                     for (uint32_t dest = 0; dest < cluster_size; dest++) {
                         if (dest == my_rank) {
-                            sends[dest][i / BLOCK_SIZE] = MPI_REQUEST_NULL;
-                            receives[dest][i / BLOCK_SIZE] = MPI_REQUEST_NULL;
+                            sends[dest][i / glb_block_size] = MPI_REQUEST_NULL;
+                            receives[dest][i / glb_block_size] = MPI_REQUEST_NULL;
                             continue;
                         }
 
                         const size_t response_offset = (batch_size * dest + i) * 4 ;
-                        mpi_check(MPI_Isend(requests_buffer + block_start * 2, actual_size * 2, MPI_UNSIGNED, dest, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &sends[dest][i / BLOCK_SIZE]));
-                        mpi_check(MPI_Irecv(response_buffer + response_offset, actual_size * 4, MPI_UNSIGNED, dest, TAG_COMPUTE_RESULT, MPI_COMM_WORLD, &receives[dest][i / BLOCK_SIZE]));
+                        mpi_check(MPI_Isend(requests_buffer + block_start * 2, actual_size * 2, MPI_UNSIGNED, dest, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &sends[dest][i / glb_block_size]));
+                        mpi_check(MPI_Irecv(response_buffer + response_offset, actual_size * 4, MPI_UNSIGNED, dest, TAG_COMPUTE_RESULT, MPI_COMM_WORLD, &receives[dest][i / glb_block_size]));
                     }
                 }
 

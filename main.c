@@ -1,3 +1,21 @@
+/*****************************************************************************************************
+* Subject: HPC - Class 1                                                                             *
+* Group: 12                                                                                          *
+* Members:                                                                                           *
+*  - Daniel Henrique Lelis de Almeida (12543822)                                                     *
+*  - Pedro Jardim                                                                                    *
+*  - Mateus Israel                                                                                   *
+*  - Lucas Almeida                                                                                   *
+*                                                                                                    *
+* Compiling:                                                                                         *
+*     1. You can use the included CMake configuration (good for IDE support)                         *
+*     2. You can compile by hand doing: mpicc main.c -o main -Wall -Ofast -lm -fopenmp -march=native *
+*                                                                                                    *
+* Running:                                                                                           *
+*     1. Single host: mpirun -n {node_count} ./main {N} {seed} {thread_count}                        *
+*     2. Multi host: mpirun -n {node_count} --hostfile {hostfile} ./main {N} {seed} {thread_count}   *
+******************************************************************************************************/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -13,6 +31,7 @@
 
 #define BATCH_SIZE 32
 #define BLOCK_SIZE 256
+
 #define DEBUG 0
 #define WAIT_ATTACH 0
 
@@ -53,8 +72,8 @@ fprintf(stderr, fmt, ##__VA_ARGS__); \
 // Types & Structs //
 /////////////////////
 
-// Since the value ranges from 0 to 99 an 8 bit int will be just enough. Using a signed to avoid accidental overflows
-// while doing calculations, even though casts will be needed anyways.
+// Since the value ranges from 0 to 99, an 8-bit int will be just enough.
+// Using a signed type to avoid accidental overflows while doing calculations, even though casts will be needed anyway.
 typedef int8_t data_t;
 
 typedef struct PartitionConfig {
@@ -66,8 +85,8 @@ typedef struct PartitionConfig {
 typedef struct DatasetPartition {
     PartitionConfig config;
     // The data is represented in column major fashion, that is, an entire column in sequence
-    // as this will be more useful for handling cache coherence and even work distribution
-    // Use SoA for better SIMD usage
+    // as this will be more useful for handling cache coherence and even work distribution.
+    // Use SoA for better SIMD usage.
     data_t* x;
     data_t* y;
     data_t* z;
@@ -163,12 +182,13 @@ static void malloc_check(const void* ptr) {
 //////////
 
 int main(int argc, char* argv[]) {
+    // Used for attaching an external debugger
     if (DEBUG && WAIT_ATTACH) {
         sleep(WAIT_ATTACH);
     }
 
     int thread_mode;
-    // MPI Initialization
+    // MPI Initialization with multi-threading support
     mpi_check(MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &thread_mode));
 
     // Cli argument parsing
@@ -189,13 +209,19 @@ int main(int argc, char* argv[]) {
     // Load cluster size
     mpi_check(MPI_Comm_size(MPI_COMM_WORLD, &cluster_size));
 
+    // Cap the number of nodes to n
     if (cluster_size > n) {
-        fprintf(stderr, "Cluster size must be smaller then N\n");
-        exit(1);
+        cluster_size = (int) n;
     }
 
     // Load rank
     mpi_check(MPI_Comm_rank(MPI_COMM_WORLD, &my_rank));
+
+    // Exit if no computation is needed from this cluster member
+    if (my_rank >= n) {
+        MPI_Finalize();
+        return 0;
+    }
 
     // Debug process info
     dbg_print("Initialized process on MPI Cluster! Cluster size: %d; My rank: %d\n", cluster_size, my_rank);
@@ -358,7 +384,7 @@ DatasetPartition* generate_distributed_matrix(
             }
         }
 
-        // Load local partition config (this operation could be avoided by conditionally writing in the lines above,
+        // Load local partition config (this operation could be avoided by conditional writing in the lines above,
         // but the readability impact is not worth it, might change it still, tho).
         memcpy(&my_data->config, &configs[0], sizeof(PartitionConfig));
         my_data->config.owned_cols = malloc(my_data->config.n_owned_cols * sizeof(uint32_t));
@@ -409,13 +435,13 @@ DatasetPartition* generate_distributed_matrix(
         for (uint8_t o = 0; o < 3; o++) {
             for (uint32_t i = 0; i < block_count; i++) {
                 const uint32_t block_start = i * BLOCK_SIZE;
-                const uint32_t block_end =  (n < block_start + BLOCK_SIZE ? n : block_start + BLOCK_SIZE) - 1;
+                const uint32_t block_end = (n < block_start + BLOCK_SIZE ? n : block_start + BLOCK_SIZE) - 1;
                 const uint32_t actual_block_size = block_end - block_start + 1;
 
                 for (uint32_t j = 0; j < actual_block_size; j++) {
                     // Generate full row
                     for (uint32_t k = 0; k < n; k++) {
-                        // This RNG won't really be uniform due to rand's range being between 0 to 2147483647
+                        // This RNG won't really be uniform due to rand's range being between 0 and 2147483647
                         work_data[k * actual_block_size + j] = (data_t) (rand() % 100); // NOLINT
                     }
                 }
@@ -531,6 +557,7 @@ DatasetPartition* generate_distributed_matrix(
     uint8_t* data_buffer = malloc(sizeof(uint32_t) * 2 + BLOCK_SIZE * my_data->config.n_owned_cols * sizeof(data_t));
     malloc_check(data_buffer);
 
+    // Receive each axis at a time
     for (uint8_t o = 0; o < 3; o++) {
         uint32_t received_rows = 0;
         while (received_rows < n) {
@@ -591,7 +618,7 @@ ComputeResult compute(
     const uint32_t block_count = (full_size - 1) / BLOCK_SIZE + 1;
     const uint32_t batch_count = (block_count - 1) / BATCH_SIZE + 1;
 
-    // Represent every request as two integers: the index + the x,y,z coords packed in a single 32 bit integer
+    // Represent every request as two integers: the index + the x,y,z coords packed in a single 32-bit integer
     const size_t request_size = 2 * sizeof(uint32_t);
     uint32_t* requests_buffer = malloc(smin(BATCH_SIZE * BLOCK_SIZE, full_size) * request_size);
     malloc_check(requests_buffer);
@@ -612,7 +639,7 @@ ComputeResult compute(
     MPI_Request sends[cluster_size][smin(BATCH_SIZE, block_count)];
     MPI_Request receives[cluster_size][smin(BATCH_SIZE, block_count)];
 
-    // Handle the process in batches, in order to limit memory for cases where N^2 doesn't fit memory.
+    // Handle the process in batches, to limit memory for cases where N^2 doesn't fit memory.
     // This process induces synchronization and, because of that, degrades performance. The bigger BATCH_SIZE
     // possible, the better the performance. Increasing BLOCK_SIZE is a question of balance, as it makes bigger
     // data transfer, which will reduce the overall communications, but will induce higher latency.
@@ -671,10 +698,10 @@ ComputeResult compute(
             // Wait for initialization to complete
             #pragma omp barrier
 
-            // This should be run in order to guarantee execution order (can be avoided later)
+            // This should be run to guarantee execution order (can be avoided later)
             #pragma omp single nowait
             {
-                // Data dependency here makes parallelization unfeasible
+                // Data dependency here makes parallelization-unfeasible
                 // Send/Receive computation results
                 for (uint32_t i = 0; i < batch_size; i+= BLOCK_SIZE) {
                     const uint32_t block_start = i;
@@ -709,7 +736,7 @@ ComputeResult compute(
                 received[i] = 0;
             }
 
-            // Implicit barrier here
+            #pragma omp barrier
 
             // Process incoming requests
             #pragma omp single nowait
@@ -834,8 +861,7 @@ ComputeResult compute(
                     }
                 }
 
-                // TODO: parallel for here
-                // Final reduction
+                // Final reduction (could parallelize, but the benefits aren't big overall)
                 for (uint32_t i = 0; i < batch_size; i++) {
                     // Introduce local values
                     results[i].max_euclidean = max(results[i].max_euclidean, my_results[i].max_euclidean);
@@ -884,7 +910,7 @@ ComputeResult compute(
             compute_result.sum_min_manhattan += manhattan_acc[1];
         }
     } else {
-        // Send Minimuns & Maximuns
+        // Send Minimums & Maximums
         uint32_t minmax_buffer[4] = {
             compute_result.max_euclidean,
             compute_result.min_euclidean,
@@ -924,15 +950,17 @@ void compute_point(
     const uint32_t target_row = target_result->idx % data->config.n;
     const uint32_t target_col = target_result->idx / data->config.n;
 
-    // Run a loop for each column. Could be paralelized, but there is not much benefit into it, since it's better to
-    // paralelize the call to this entire function for each point.
+    // Run a loop for each column.
+    // Could be parallelized, but there is not much benefit into it, since it's better to parallelize the call to this
+    // entire function for each point.
     for (uint32_t i = 0; i < data->config.n_owned_cols; i++) {
         const uint32_t col = data->config.owned_cols[i];
         const size_t col_offset = data->config.n * i;
         const uint32_t st_row = target_row + (col <= target_col ? 1 : 0);
 
-        // All those loop breaks might look overkill or dumb, but it really does matter for the optimizer to apply SIMD
-        // optimizations better. (Trust me, I disassembled the code and checked, luls)
+        // All those loop breaks might look overkill or foolish, but it really does matter for the optimizer to apply
+        // SIMD optimizations better.
+        // (Trust me, I disassembled the code and checked luls)
 
         // Use local buffers for better SIMD
         int8_t xd[data->config.n];

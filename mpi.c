@@ -195,13 +195,19 @@ int main(int argc, char* argv[]) {
     // Load cluster size
     mpi_check(MPI_Comm_size(MPI_COMM_WORLD, &cluster_size));
 
+    // Cap the number of nodes to n
     if (cluster_size > n) {
-        fprintf(stderr, "Cluster size must be smaller then N\n");
-        exit(1);
+        cluster_size = (int) n;
     }
 
     // Load rank
     mpi_check(MPI_Comm_rank(MPI_COMM_WORLD, &my_rank));
+
+    // Exit if no computation is needed from this cluster member
+    if (my_rank >= n) {
+        MPI_Finalize();
+        return 0;
+    }
 
     // Debug process info
     dbg_print("Initialized process on MPI Cluster! Cluster size: %d; My rank: %d\n", cluster_size, my_rank);
@@ -413,7 +419,7 @@ DatasetPartition* generate_distributed_matrix(
         for (uint8_t o = 0; o < 3; o++) {
             for (uint32_t i = 0; i < block_count; i++) {
                 const uint32_t block_start = i * BLOCK_SIZE;
-                const uint32_t block_end =  (n < block_start + BLOCK_SIZE ? n : block_start + BLOCK_SIZE) - 1;
+                const uint32_t block_end = (n < block_start + BLOCK_SIZE ? n : block_start + BLOCK_SIZE) - 1;
                 const uint32_t actual_block_size = block_end - block_start + 1;
 
                 for (uint32_t j = 0; j < actual_block_size; j++) {
