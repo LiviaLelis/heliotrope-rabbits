@@ -12,8 +12,8 @@
 // Configs //
 /////////////
 
-#define BATCH_SIZE 8
-#define BLOCK_SIZE 8
+#define BATCH_SIZE 64
+#define BLOCK_SIZE 64
 #define DEBUG 0
 
 #define TAG_CONFIG 1
@@ -637,10 +637,10 @@ ComputeResult compute(
     const uint32_t batch_count = (block_count - 1) / BATCH_SIZE + 1;
 
     // Represent every request as two integers: the index + the x,y,z coords packed in a single 32 bit integer
-    const size_t request_size = 4 * sizeof(uint32_t);
+    const size_t request_size = 2 * sizeof(uint32_t);
     uint32_t* requests_buffer = malloc(smin(BATCH_SIZE * BLOCK_SIZE, full_size) * request_size);
 
-    // Represent every response as 5 32-bit integers (idx, min_euc, max_euc, min_man, max_man)
+    // Represent every response as 4 32-bit integers (min_euc, max_euc, min_man, max_man)
     const size_t response_size = 4 * sizeof(uint32_t);
     uint32_t* response_buffer = malloc(cluster_size * smin(BATCH_SIZE * BLOCK_SIZE, full_size) * response_size);
 
@@ -676,14 +676,8 @@ ComputeResult compute(
             const uint32_t col = data->config.owned_cols[idx / data->config.n];
             const uint32_t global_idx = col * data->config.n + row;
 
-            if (data->x[idx] > 100) {
-                printf("WTF?? %u %u %u\n", (uint32_t) data->x[idx], row, col);
-            }
-
-            requests_buffer[4*i] = global_idx;
-            requests_buffer[4*i + 1] = data->x[idx];
-            requests_buffer[4*i + 2] = data->y[idx];
-            requests_buffer[4*i + 3] = data->z[idx];
+            requests_buffer[2*i] = global_idx;
+            requests_buffer[2*i + 1] = (uint32_t) data->x[idx] << 16 | (uint32_t) data->y[idx] << 8 | data->z[idx];
 
             local_results[i] = (ComputeTargetResultLocal){
                 .min_euclidean = UINT32_MAX,
@@ -718,7 +712,7 @@ ComputeResult compute(
                 }
 
                 const size_t response_offset = (batch_size * dest + i) * 4 ;
-                MPI_Isend(requests_buffer + block_start * 4, actual_size * 4, MPI_UNSIGNED, dest, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &sends[dest][i / BLOCK_SIZE]);
+                MPI_Isend(requests_buffer + block_start * 2, actual_size * 2, MPI_UNSIGNED, dest, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &sends[dest][i / BLOCK_SIZE]);
                 MPI_Irecv(response_buffer + response_offset, actual_size * 4, MPI_UNSIGNED, dest, TAG_COMPUTE_RESULT, MPI_COMM_WORLD, &receives[dest][i / BLOCK_SIZE]);
             }
         }
@@ -756,7 +750,7 @@ ComputeResult compute(
                 uint32_t recv_buffer[recv_size];
                 MPI_Recv(&recv_buffer, recv_size, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &recv_status);
 
-                const uint32_t actual_block_size = recv_size / 4;
+                const uint32_t actual_block_size = recv_size / 2;
 
                 // Setup send buffer
                 uint32_t send_buffer[actual_block_size * 4];
@@ -764,12 +758,12 @@ ComputeResult compute(
                 // Compute every point
                 for (uint32_t j = 0; j < actual_block_size; j++) {
                     const uint32_t send_buffer_offset = 4 * j;
-                    const uint32_t recv_buffer_offset = 4 * j;
+                    const uint32_t recv_buffer_offset = 2 * j;
                     ComputeTargetResult cur_result = {
                         .idx =  recv_buffer[recv_buffer_offset],
-                        .x = (data_t) recv_buffer[recv_buffer_offset + 1],
-                        .y = (data_t) recv_buffer[recv_buffer_offset + 2],
-                        .z = (data_t) recv_buffer[recv_buffer_offset + 3],
+                        .x = (data_t) (recv_buffer[recv_buffer_offset + 1] >> 16 & 0x000000ff),
+                        .y = (data_t) (recv_buffer[recv_buffer_offset + 1] >> 8 & 0x000000ff),
+                        .z = (data_t) (recv_buffer[recv_buffer_offset + 1] & 0x000000ff),
                         .min_euclidean = UINT32_MAX,
                         .max_euclidean = 0,
                         .min_manhattan = UINT32_MAX,
