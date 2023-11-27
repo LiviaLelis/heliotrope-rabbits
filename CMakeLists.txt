@@ -56,3 +56,20 @@ target_link_libraries(HeliotropeRabbits-MPI PUBLIC OpenMP::OpenMP_C)
 # MPI Handling
 message(STATUS "Run: ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} ${MPIEXEC_MAX_NUMPROCS} ${MPIEXEC_PREFLAGS} EXECUTABLE ${MPIEXEC_POSTFLAGS} ARGS")
 target_link_libraries(HeliotropeRabbits-MPI PUBLIC MPI::MPI_C)
+
+######################################
+# Add MPI + OMP on Thread Serialized #
+######################################
+
+# Main Program
+add_executable(HeliotropeRabbits-MPI-Serialized mpi-omp-serialized.c)
+
+# Math
+target_link_libraries(HeliotropeRabbits-MPI-Serialized PUBLIC m)
+
+# OpenMP Handling
+target_link_libraries(HeliotropeRabbits-MPI-Serialized PUBLIC OpenMP::OpenMP_C)
+
+# MPI Handling
+message(STATUS "Run: ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} ${MPIEXEC_MAX_NUMPROCS} ${MPIEXEC_PREFLAGS} EXECUTABLE ${MPIEXEC_POSTFLAGS} ARGS")
+target_link_libraries(HeliotropeRabbits-MPI-Serialized PUBLIC MPI::MPI_C)

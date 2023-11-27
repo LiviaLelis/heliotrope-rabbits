@@ -73,6 +73,19 @@ typedef struct DatasetPartition {
     data_t* z;
 } DatasetPartition;
 
+typedef struct PartitionChunk {
+    uint32_t from_row;
+    uint32_t to_row;
+    data_t* data;
+} PartitionChunk;
+
+typedef struct ComputeTargetRequest {
+    uint32_t idx;
+    data_t x;
+    data_t y;
+    data_t z;
+} ComputeTargetRequest;
+
 // Keep all the euclideans squared, as we can calculate the SQRT only once at the end
 typedef struct ComputeTargetResult {
     uint32_t idx;
@@ -109,9 +122,9 @@ typedef struct ComputeResult {
 // Declarations //
 //////////////////
 
-void parse_args(int argc, char* argv[], uint32_t* n, uint32_t* seed, int32_t* thread_count);
+void parse_args(int argc, char* argv[], uint32_t* n, uint32_t* seed, uint32_t* thread_count);
 DatasetPartition* generate_distributed_matrix(uint32_t n, uint32_t seed, int cluster_size, int my_rank);
-ComputeResult compute(const DatasetPartition* data, int my_rank, int cluster_size);
+ComputeResult compute(const DatasetPartition* data, int my_rank, int cluster_size, int thread_count);
 void compute_point(const DatasetPartition* data, ComputeTargetResult* target_result);
 
 // Fast, branch-less, ABS calculation for integers
@@ -169,12 +182,12 @@ int main(int argc, char* argv[]) {
 
     int thread_mode;
     // MPI Initialization
-    mpi_check(MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &thread_mode));
+    mpi_check(MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &thread_mode));
 
     // Cli argument parsing
     uint32_t n;
     uint32_t seed;
-    int32_t thread_count;
+    uint32_t thread_count;
     parse_args(argc, argv, &n, &seed, &thread_count);
 
     // OpenMP configs
@@ -204,7 +217,6 @@ int main(int argc, char* argv[]) {
     DatasetPartition* my_data = generate_distributed_matrix(n, seed, cluster_size, my_rank);
 
     // Print the current node partition data (when DEBUG is enabled)
-    // NOLINTBEGIN
     if (DEBUG == 2) {
         dbg_print("Partition %u data:\n", my_rank);
         for (uint32_t i = 0; i < my_data->config.n_owned_cols; i++) {
@@ -219,12 +231,11 @@ int main(int argc, char* argv[]) {
             dbg_print_clean("]\n");
         }
     }
-    // NOLINTEND
 
-    const ComputeResult result = compute(my_data, my_rank, cluster_size);
+    const ComputeResult result = compute(my_data, my_rank, cluster_size, thread_count);
 
     if (my_rank == 0) {
-        printf("Distância de Manhattan mínima: %u (soma min: %lu) e máxima: %u (soma max: %lu).\n", result.min_manhattan, result.sum_min_manhattan, result.max_manhattan, result.sum_max_manhattan);
+        printf("Distância de Manhattan mínima: %u (soma min: %llu) e máxima: %u (soma max: %llu).\n", result.min_manhattan, result.sum_min_manhattan, result.max_manhattan, result.sum_max_manhattan);
         printf("Distância Euclidiana mínima: %.2lf (soma min: %.2lf) e máxima: %.2lf (soma max: %.2lf).\n", sqrt(result.min_euclidean), result.sum_min_euclidean, sqrt(result.max_euclidean), result.sum_max_euclidean);
     }
 
@@ -246,7 +257,7 @@ int main(int argc, char* argv[]) {
  * \param seed pointer to the seed variable
  * \param thread_count pointer to the thread count variable
  */
-void parse_args(const int argc, char* argv[], uint32_t* n, uint32_t* seed, int32_t* thread_count) {
+void parse_args(const int argc, char* argv[], uint32_t* n, uint32_t* seed, uint32_t* thread_count) {
     // Load matrix rank
     if (argc >= 2) {
         *n = strtoul(argv[1], NULL, 10);
@@ -269,7 +280,7 @@ void parse_args(const int argc, char* argv[], uint32_t* n, uint32_t* seed, int32
 
     // Load local thread count to be used
     if (argc >= 4) {
-        *thread_count = (int32_t) strtoul(argv[3], NULL, 10);
+        *thread_count = strtoul(argv[3], NULL, 10);
         dbg_print("Received CLI arg thread_count=%u\n", *thread_count);
     }
     else {
@@ -315,7 +326,7 @@ DatasetPartition* generate_distributed_matrix(
         malloc_check(configs);
 
         /**
-         * Partitioning strategy: in order to ensure a more even workload distribution across all members,
+         * Partiotining strategy: in order to ensure a more even workload distribution accross all members,
          * we are distributing the data in columns. One important aspect to notice is that the later columns
          * need to do less work overall. As a mitigation, we are employing two strategies: firstly we round-robin
          * each column across the nodes, instead of allocating sequential ones. Secondly, we alternate the order,
@@ -377,7 +388,7 @@ DatasetPartition* generate_distributed_matrix(
             memcpy(&config_buffer[2], configs[i].owned_cols, sizeof(uint32_t) * configs[i].n_owned_cols);
 
             // Send the configs in a single shot
-            mpi_check(MPI_Send(config_buffer, (int) configs[i].n_owned_cols + 2, MPI_UNSIGNED, i, TAG_CONFIG, MPI_COMM_WORLD)); // NOLINT
+            mpi_check(MPI_Send(config_buffer, configs[i].n_owned_cols + 2, MPI_UNSIGNED, i, TAG_CONFIG, MPI_COMM_WORLD));
         }
 
         // Allocate my x partition
@@ -416,7 +427,7 @@ DatasetPartition* generate_distributed_matrix(
                     // Generate full row
                     for (uint32_t k = 0; k < n; k++) {
                         // This RNG won't really be uniform due to rand's range being between 0 to 2147483647
-                        work_data[k * actual_block_size + j] = (data_t) (rand() % 100); // NOLINT
+                        work_data[k * actual_block_size + j] = rand() % 100;
                     }
                 }
 
@@ -454,7 +465,7 @@ DatasetPartition* generate_distributed_matrix(
                         memcpy(data_buffer + dest_offset, work_data + src_offset, actual_block_size * sizeof(data_t));
                     }
                     // Send the current block data to it's node
-                    mpi_check(MPI_Send(data_buffer, buffer_prefix_offset + configs[j].n_owned_cols * actual_block_size * sizeof(data_t), MPI_BYTE, j, TAG_DATA, MPI_COMM_WORLD)); // NOLINT
+                    mpi_check(MPI_Send(data_buffer, buffer_prefix_offset + configs[j].n_owned_cols * actual_block_size * sizeof(data_t), MPI_BYTE, j, TAG_DATA, MPI_COMM_WORLD));
                 }
             }
         }
@@ -484,7 +495,7 @@ DatasetPartition* generate_distributed_matrix(
     uint32_t* config_buffer = malloc(config_len * sizeof(uint32_t));
     malloc_check(config_buffer);
 
-    mpi_check(MPI_Recv(config_buffer, config_len, MPI_UNSIGNED, 0, TAG_CONFIG, MPI_COMM_WORLD, &config_status)); // NOLINT
+    mpi_check(MPI_Recv(config_buffer, config_len, MPI_UNSIGNED, 0, TAG_CONFIG, MPI_COMM_WORLD, &config_status));
 
     // Load config data
     my_data->config.n = config_buffer[0];
@@ -572,7 +583,8 @@ DatasetPartition* generate_distributed_matrix(
 ComputeResult compute(
     const DatasetPartition* data,
     const int my_rank,
-    const int cluster_size
+    const int cluster_size,
+    const int thread_count
 ) {
     ComputeResult compute_result = {
         .min_euclidean = UINT32_MAX,
@@ -613,40 +625,37 @@ ComputeResult compute(
     MPI_Request receives[cluster_size][smin(BATCH_SIZE, block_count)];
 
     // Handle the process in batches, in order to limit memory for cases where N^2 doesn't fit memory.
-    // This process induces synchronization and, because of that, degrades performance. The bigger BATCH_SIZE
+    // This process induces sincronization and, because of that, degrades performance. The bigger BATCH_SIZE
     // possible, the better the performance. Increasing BLOCK_SIZE is a question of balance, as it makes bigger
     // data transfer, which will reduce the overall communications, but will induce higher latency.
     for (uint32_t batch_n = 0; batch_n < batch_count; batch_n++) {
         dbg_print("[Node %d] Computing batch %u\n", my_rank, batch_n);
+        // Compute offsets
+        const size_t batch_offset_block = BATCH_SIZE * batch_n;
+        const size_t batch_offset = BLOCK_SIZE * batch_offset_block;
+
+        const uint32_t batch_start_block = batch_n * BATCH_SIZE;
+        const uint32_t batch_end_block = (batch_start_block + BATCH_SIZE > block_count ? block_count : batch_start_block + BATCH_SIZE) - 1;
+        const uint32_t batch_block_count = batch_end_block - batch_start_block + 1;
+
+        const uint32_t batch_start = batch_n * BATCH_SIZE * BLOCK_SIZE;
+        const uint32_t batch_end = ((batch_n + 1) * BATCH_SIZE * BLOCK_SIZE > full_size ? full_size : (batch_n + 1) * BATCH_SIZE * BLOCK_SIZE) - 1;
+        const uint32_t batch_size = batch_end - batch_start + 1;
 
         // Parallel region
-        #pragma omp parallel default(none) \
-                firstprivate(batch_n, cluster_size, my_rank, block_count, full_size) \
-                shared(send_handshake, data, requests_buffer, results, sends, receives, \
-                       received, response_buffer, expected_blocks, my_results, compute_result, \
-                       ompi_mpi_comm_world, ompi_mpi_unsigned, ompi_request_null)
+        #pragma omp parallel
         {
-            // Compute offsets
-            const size_t batch_offset_block = BATCH_SIZE * batch_n;
-            const size_t batch_offset = BLOCK_SIZE * batch_offset_block;
-
-            const uint32_t batch_start_block = batch_n * BATCH_SIZE;
-            const uint32_t batch_end_block = (batch_start_block + BATCH_SIZE > block_count ? block_count : batch_start_block + BATCH_SIZE) - 1;
-            const uint32_t batch_block_count = batch_end_block - batch_start_block + 1;
-
-            const uint32_t batch_start = batch_n * BATCH_SIZE * BLOCK_SIZE;
-            const uint32_t batch_end = ((batch_n + 1) * BATCH_SIZE * BLOCK_SIZE > full_size ? full_size : (batch_n + 1) * BATCH_SIZE * BLOCK_SIZE) - 1;
-            const uint32_t batch_size = batch_end - batch_start + 1;
-
             // Send initial information (number of blocks to be sent)
-            // As this isn't computationally intensive, this is better off running in a single thread
-            #pragma omp for nowait
-            for (uint32_t i = 0; i < cluster_size; i++) {
-                if (i == my_rank) {
-                    continue;
-                }
+            // As this isn't computationally intensive, this is better of running in a single thread
+            #pragma omp single nowait
+            {
+                for (uint32_t i = 0; i < cluster_size; i++) {
+                    if (i == my_rank) {
+                        continue;
+                    }
 
-                mpi_check(MPI_Isend(&batch_block_count, 1, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &send_handshake[i])); // NOLINT
+                    mpi_check(MPI_Isend(&batch_block_count, 1, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &send_handshake[i]));
+                }
             }
 
             // Initialize request buffers
@@ -672,16 +681,16 @@ ComputeResult compute(
             #pragma omp barrier
 
             // This should be run in order to guarantee execution order (can be avoided later)
-            #pragma omp single nowait
+            #pragma omp single
             {
-                // Data dependency here makes parallelization unfeasible
+                // Data dependency here makes parallelization unfeasable
                 // Send/Receive computation results
                 for (uint32_t i = 0; i < batch_size; i+= BLOCK_SIZE) {
                     const uint32_t block_start = i;
                     const uint32_t block_end = (i + BLOCK_SIZE > batch_size ? batch_size : i + BLOCK_SIZE) - 1;
                     const uint32_t actual_size =  block_end - block_start + 1;
 
-                    // Do the send/receive pair for each node, avoiding the need for synchronization through the use of non-blocking
+                    // Do the send/receive pair for each node, avoiding the need for sincronization through the use of non-blocking
                     // calls.
                     for (uint32_t dest = 0; dest < cluster_size; dest++) {
                         if (dest == my_rank) {
@@ -691,22 +700,20 @@ ComputeResult compute(
                         }
 
                         const size_t response_offset = (batch_size * dest + i) * 4 ;
-                        mpi_check(MPI_Isend(requests_buffer + block_start * 2, actual_size * 2, MPI_UNSIGNED, dest, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &sends[dest][i / BLOCK_SIZE])); // NOLINT
-                        mpi_check(MPI_Irecv(response_buffer + response_offset, actual_size * 4, MPI_UNSIGNED, dest, TAG_COMPUTE_RESULT, MPI_COMM_WORLD, &receives[dest][i / BLOCK_SIZE])); // NOLINT
+                        mpi_check(MPI_Isend(requests_buffer + block_start * 2, actual_size * 2, MPI_UNSIGNED, dest, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &sends[dest][i / BLOCK_SIZE]));
+                        mpi_check(MPI_Irecv(response_buffer + response_offset, actual_size * 4, MPI_UNSIGNED, dest, TAG_COMPUTE_RESULT, MPI_COMM_WORLD, &receives[dest][i / BLOCK_SIZE]));
                     }
                 }
 
-            }
-
-            // Receive initial information from every node
-            #pragma omp for nowait
-            for (uint32_t i = 0; i < cluster_size; i++) {
-                if (i == my_rank) {
-                    continue;
+                // Receive initial information from every node
+                for (uint32_t i = 0; i < cluster_size; i++) {
+                    if (i == my_rank) {
+                        continue;
+                    }
+                    MPI_Status status;
+                    mpi_check(MPI_Recv(&expected_blocks[i], 1, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &status));
+                    received[i] = 0;
                 }
-                MPI_Status status;
-                mpi_check(MPI_Recv(&expected_blocks[i], 1, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &status)); // NOLINT
-                received[i] = 0;
             }
 
             // Implicit barrier here
@@ -726,17 +733,16 @@ ComputeResult compute(
                             continue;
                         }
 
-                        #pragma omp task default(shared) firstprivate(i) // NOLINT
                         {
                             // Retrieve incoming request
                             MPI_Status recv_status;
                             int32_t recv_size;
 
-                            mpi_check(MPI_Probe(i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &recv_status)); // NOLINT
+                            mpi_check(MPI_Probe(i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &recv_status));
                             mpi_check(MPI_Get_count(&recv_status, MPI_UNSIGNED, &recv_size));
 
                             uint32_t recv_buffer[recv_size];
-                            mpi_check(MPI_Recv(&recv_buffer, recv_size, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &recv_status)); // NOLINT
+                            mpi_check(MPI_Recv(&recv_buffer, recv_size, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &recv_status));
 
                             const uint32_t actual_block_size = recv_size / 2;
 
@@ -767,7 +773,7 @@ ComputeResult compute(
                             }
 
                             // Send block results
-                            mpi_check(MPI_Send(send_buffer, actual_block_size * 4, MPI_UNSIGNED, i, TAG_COMPUTE_RESULT, MPI_COMM_WORLD)); // NOLINT
+                            mpi_check(MPI_Send(send_buffer, actual_block_size * 4, MPI_UNSIGNED, i, TAG_COMPUTE_RESULT, MPI_COMM_WORLD));
 
                             // Track progression
                             received[i]++;
@@ -777,7 +783,6 @@ ComputeResult compute(
                             }
                         }
                     }
-                    #pragma omp taskwait
                 }
             }
 
@@ -821,7 +826,7 @@ ComputeResult compute(
                     if (i == my_rank) {
                         continue;
                     }
-                    mpi_check(MPI_Waitall(batch_block_count, receives[i], MPI_STATUSES_IGNORE)); // NOLINT
+                    mpi_check(MPI_Waitall(batch_block_count, receives[i], MPI_STATUSES_IGNORE));
 
                     // Reduce data with each of the results
                     const uint32_t cluster_offset = batch_size * i;
@@ -834,7 +839,6 @@ ComputeResult compute(
                     }
                 }
 
-                // TODO: parallel for here
                 // Final reduction
                 for (uint32_t i = 0; i < batch_size; i++) {
                     // Introduce local values
@@ -870,9 +874,9 @@ ComputeResult compute(
             double euclidean_acc[2];
             uint64_t manhattan_acc[2];
 
-            mpi_check(MPI_Recv(minmax_buffer, 4, MPI_UNSIGNED, i, TAG_FINAL_RESULT, MPI_COMM_WORLD, MPI_STATUS_IGNORE)); // NOLINT
-            mpi_check(MPI_Recv(euclidean_acc, 2, MPI_DOUBLE, i, TAG_FINAL_RESULT, MPI_COMM_WORLD, MPI_STATUS_IGNORE)); // NOLINT
-            mpi_check(MPI_Recv(manhattan_acc, 2, MPI_UNSIGNED_LONG_LONG, i, TAG_FINAL_RESULT, MPI_COMM_WORLD, MPI_STATUS_IGNORE)); // NOLINT
+            mpi_check(MPI_Recv(minmax_buffer, 4, MPI_UNSIGNED, i, TAG_FINAL_RESULT, MPI_COMM_WORLD, MPI_STATUS_IGNORE));
+            mpi_check(MPI_Recv(euclidean_acc, 2, MPI_DOUBLE, i, TAG_FINAL_RESULT, MPI_COMM_WORLD, MPI_STATUS_IGNORE));
+            mpi_check(MPI_Recv(manhattan_acc, 2, MPI_UNSIGNED_LONG_LONG, i, TAG_FINAL_RESULT, MPI_COMM_WORLD, MPI_STATUS_IGNORE));
 
             compute_result.max_euclidean = max(compute_result.max_euclidean, minmax_buffer[0]);
             compute_result.min_euclidean = max(compute_result.min_euclidean, minmax_buffer[1]);
@@ -892,7 +896,7 @@ ComputeResult compute(
             compute_result.min_manhattan
         };
 
-        mpi_check(MPI_Send(minmax_buffer, 4, MPI_UNSIGNED, 0, TAG_FINAL_RESULT, MPI_COMM_WORLD)); // NOLINT
+        mpi_check(MPI_Send(minmax_buffer, 4, MPI_UNSIGNED, 0, TAG_FINAL_RESULT, MPI_COMM_WORLD));
 
         // Send accumulations
         double euclidean_acc[2] = {
@@ -900,14 +904,14 @@ ComputeResult compute(
             compute_result.sum_min_euclidean
         };
 
-        mpi_check(MPI_Send(euclidean_acc, 2, MPI_DOUBLE, 0, TAG_FINAL_RESULT, MPI_COMM_WORLD)); // NOLINT
+        mpi_check(MPI_Send(euclidean_acc, 2, MPI_DOUBLE, 0, TAG_FINAL_RESULT, MPI_COMM_WORLD));
 
         uint64_t manhattan_acc[2] = {
             compute_result.sum_max_manhattan,
             compute_result.sum_min_manhattan
         };
 
-        mpi_check(MPI_Send(manhattan_acc, 2, MPI_UNSIGNED_LONG_LONG, 0, TAG_FINAL_RESULT, MPI_COMM_WORLD)); // NOLINT
+        mpi_check(MPI_Send(manhattan_acc, 2, MPI_UNSIGNED_LONG_LONG, 0, TAG_FINAL_RESULT, MPI_COMM_WORLD));
     }
 
     free(requests_buffer);
@@ -942,17 +946,17 @@ void compute_point(
         // Calculate differences
         #pragma omp simd
         for (uint32_t j = st_row; j < data->config.n; j++) {
-            xd[j] = (int8_t) (target_result->x - data->x[col_offset + j]);
-            yd[j] = (int8_t) (target_result->y - data->y[col_offset + j]);
-            zd[j] = (int8_t) (target_result->z - data->z[col_offset + j]);
+            xd[j] = target_result->x - data->x[col_offset + j];
+            yd[j] = target_result->y - data->y[col_offset + j];
+            zd[j] = target_result->z - data->z[col_offset + j];
         }
 
         // Calculate differences abs
         #pragma omp simd
         for (uint32_t j = st_row; j < data->config.n; j++) {
-            xd[j] = (int8_t) fast_abs(xd[j]);
-            yd[j] = (int8_t) fast_abs(yd[j]);
-            zd[j] = (int8_t) fast_abs(zd[j]);
+            xd[j] = fast_abs(xd[j]);
+            yd[j] = fast_abs(yd[j]);
+            zd[j] = fast_abs(zd[j]);
         }
 
         // Distance Reduction
