@@ -12,8 +12,8 @@
 // Configs //
 /////////////
 
-#define BATCH_SIZE 64
-#define BLOCK_SIZE 64
+#define BATCH_SIZE 32
+#define BLOCK_SIZE 256
 #define DEBUG 0
 
 #define TAG_CONFIG 1
@@ -965,19 +965,3 @@ void compute_point(
         }
     }
 }
-
-// ComputeResult compute_local(
-//     DatasetPartition* data,
-//     int my_rank,
-//     int cluster_size
-// ) {
-//
-// }
-//
-// ComputeResult compute_remote(
-//     DatasetPartition* data,
-//     int my_rank,
-//     int cluster_size
-// ) {
-//
-// }
