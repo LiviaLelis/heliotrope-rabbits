@@ -5,9 +5,14 @@ project(HeliotropeRabbits C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_FLAGS_DEBUG_INIT "-Wall -g -fsanitize=unknown -fsanitize=address -Og -lm -fopenmp -march=native")
 set(CMAKE_C_FLAGS_RELEASE_INIT "-Wall -Ofast -lm -fopenmp -march=native")
+set(CMAKE_CXX_FLAGS_DEBUG_INIT "-Wall -g -fsanitize=unknown -fsanitize=address -Og -lm -fopenmp -march=native")
+set(CMAKE_CXX_FLAGS_RELEASE_INIT "-Wall -Ofast -lm -fopenmp -march=native")
 
 # Main Program
 add_executable(HeliotropeRabbits main.c)
+
+# Math
+target_link_libraries(HeliotropeRabbits PUBLIC m)
 
 # OpenMP Handling
 find_package(OpenMP REQUIRED)
