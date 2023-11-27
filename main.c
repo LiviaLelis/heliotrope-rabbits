@@ -127,6 +127,13 @@ DatasetPartition* generate_distributed_matrix(uint32_t n, uint32_t seed, int clu
 ComputeResult compute(const DatasetPartition* data, int my_rank, int cluster_size);
 void compute_point(const DatasetPartition* data, ComputeTargetResult* target_result);
 
+// Fast, branch-less, ABS calculation for integers
+// Src: https://graphics.stanford.edu/~seander/bithacks.html#IntegerAbs
+static uint8_t fast_abs(const int8_t v) {
+    const uint8_t mask = v >> 7;
+    return v + mask ^ mask;
+}
+
 //////////
 // Impl //
 //////////
@@ -433,7 +440,7 @@ DatasetPartition* generate_distributed_matrix(
                     for (uint32_t k = 0; k < configs[j].n_owned_cols; k++) {
                         // Memory offset calculation
                         const uint32_t cur_col = configs[j].owned_cols[k];
-                        const size_t dest_offset = buffer_prefix_offset + (k * actual_block_size) * sizeof(data_t);
+                        const size_t dest_offset = buffer_prefix_offset + k * actual_block_size * sizeof(data_t);
                         const size_t src_offset = n * cur_col;
                         // Copy all the rows of column at a time
                         memcpy(data_buffer + dest_offset, work_data + src_offset, actual_block_size * sizeof(data_t));
@@ -577,9 +584,9 @@ ComputeResult compute(
     int my_rank,
     int cluster_size
 ) {
-    ComputeResult result = {
-        .min_euclidean = INFINITY,
-        .max_euclidean = -INFINITY,
+    ComputeResult compute_result = {
+        .min_euclidean = UINT32_MAX,
+        .max_euclidean = 0,
         .min_manhattan = UINT32_MAX,
         .max_manhattan = 0,
 
@@ -591,8 +598,12 @@ ComputeResult compute(
 
     // Request/Response data
     const size_t full_size = data->config.n * data->config.n_owned_cols;
-    ComputeTargetRequest* requests_buffer = malloc(full_size * sizeof(ComputeTargetRequest));
+
+    // Represent every request as two integers: the index + the x,y,z coords packed in a single 32 bit integer
+    uint32_t* requests_buffer = malloc(full_size * 2 * sizeof(uint32_t));
+
     ComputeTargetResultLocal* local_results = malloc(full_size * sizeof(ComputeTargetResultLocal));
+    ComputeTargetResultLocal* external_results = malloc(full_size * sizeof(ComputeTargetResultLocal));
     uint32_t received = 0;
 
     // Initialize the data
@@ -602,36 +613,67 @@ ComputeResult compute(
         const uint32_t col = data->config.owned_cols[i / data->config.n];
         const uint32_t global_idx = col * data->config.n + row;
 
-        requests_buffer[i] = (ComputeTargetRequest){
-            .idx = global_idx,
-            .x = data->x[i],
-            .y = data->y[i],
-            .z = data->z[i],
-        };
+        requests_buffer[2*i] = global_idx;
+        requests_buffer[2*i + 1] = (uint32_t) data->x[i] << 16 | (uint32_t) data->x[i] << 8 | (uint32_t) data->x[i] << 0;
 
-        local_results[i] = (ComputeTargetResultLocal){
-            .min_euclidean = INFINITY,
-            .max_euclidean = -INFINITY,
+
+        local_results[i] = external_results[i] = (ComputeTargetResultLocal){
+            .min_euclidean = UINT32_MAX,
+            .max_euclidean = 0,
             .min_manhattan = UINT32_MAX,
             .max_manhattan =  0
         };
     }
 
-    ComputeTargetResult example = {
-        31,
-        12,
-        4,
-        82,
-        UINT32_MAX,
-        0,
-        UINT32_MAX,
-        0
-    };
+    // Total number of broadcasts needed to send
+    uint32_t block_sends = (full_size - 1) / BLOCK_SIZE + 1;
+    MPI_Request sends[block_sends];
 
-    compute_point(data, &example);
+    #pragma omp parallel
+    {
+        #pragma omp for nowait
+        for (uint32_t i = 0; i < full_size; i++) {
+            // dbg_print("[Node %d - Thread %d] Computing the results for point %u\n", my_rank, omp_get_thread_num(), i);
+            const uint32_t row = i % data->config.n;
+            const uint32_t col = data->config.owned_cols[i / data->config.n];
+            const uint32_t global_idx = col * data->config.n + row;
 
+            ComputeTargetResult result = (ComputeTargetResult){
+                .idx = global_idx,
+                .x = data->x[i],
+                .y = data->y[i],
+                .z = data->z[i],
+                .min_manhattan = UINT32_MAX,
+                .max_manhattan = 0,
+                .min_euclidean = UINT32_MAX,
+                .max_euclidean = UINT32_MAX
+            };
 
-    // Task 1: Compute local values
+            compute_point(data, &result);
+
+            local_results[i].min_euclidean = result.min_euclidean;
+            local_results[i].max_euclidean = result.max_euclidean;
+            local_results[i].min_manhattan = result.min_manhattan;
+            local_results[i].max_manhattan = result.max_manhattan;
+        }
+
+        #pragma omp single
+        {
+            // Publish points to be computed
+            #pragma omp task
+            {
+                for (uint32_t i = 0; i < full_size; i += BLOCK_SIZE) {
+                    const uint32_t start_block = i * 2;
+                    const uint32_t end_block = (i + BLOCK_SIZE > full_size ?  full_size : i + BLOCK_SIZE) - 1;
+                    const uint32_t actual_size = end_block - start_block + 1;
+                    MPI_Ibcast(requests_buffer, actual_size * 2, MPI_UNSIGNED, my_rank, MPI_COMM_WORLD, &sends[i / BLOCK_SIZE]);
+                }
+            }
+
+            // Receive remotes
+
+        }
+    }
     // Task 2: Send remote computes
     // Task 3: Receive remote computes
 
@@ -641,14 +683,7 @@ ComputeResult compute(
 
     free(requests_buffer);
     free(local_results);
-    return result;
-}
-
-// Fast, branch-less, ABS calculation for integers
-// Src: https://graphics.stanford.edu/~seander/bithacks.html#IntegerAbs
-static uint8_t fast_abs(const int8_t v) {
-    const uint8_t mask = v >> 7;
-    return (v + mask) ^ mask;
+    return compute_result;
 }
 
 void compute_point(
@@ -665,43 +700,58 @@ void compute_point(
         const size_t col_offset = data->config.n * i;
         const uint32_t st_row = target_row + (col < target_col ? 1 : 0);
 
-        #pragma omp for simd
+        // All those loop breaks might look overkill or dumb, but it really does matter for the optimizer to apply SIMD
+        // optimizations better. (Trust me, I disassembled the code and checked, luls)
+
+        // Use local buffers for better SIMD
+        int8_t xd[data->config.n];
+        int8_t yd[data->config.n];
+        int8_t zd[data->config.n];
+
+        // Calculate differences
+        #pragma omp simd
         for (uint32_t j = st_row; j < data->config.n; j++) {
-            // SIMD-able block
-            const int8_t xd = target_result->x - data->x[col_offset + j];
-            const int8_t yd = target_result->y - data->y[col_offset + j];
-            const int8_t zd = target_result->z - data->z[col_offset + j];
+            xd[j] = target_result->x - data->x[col_offset + j];
+            yd[j] = target_result->y - data->y[col_offset + j];
+            zd[j] = target_result->z - data->z[col_offset + j];
+        }
 
-            // SIMD-able block
-            const uint8_t axd = fast_abs(xd);
-            const uint8_t ayd = fast_abs(yd);
-            const uint8_t azd = fast_abs(zd);
+        // Calculate differences abs
+        #pragma omp simd
+        for (uint32_t j = st_row; j < data->config.n; j++) {
+            xd[j] = fast_abs(xd[j]);
+            yd[j] = fast_abs(yd[j]);
+            zd[j] = fast_abs(zd[j]);
+        }
 
+        // Distance Reduction
+        #pragma omp simd
+        for (uint32_t j = st_row; j < data->config.n; j++) {
             // Manhattan
-            const uint32_t manhattan = (uint32_t) axd + ayd + azd;
-            target_result->min_manhattan = (manhattan < target_result->min_manhattan) ? manhattan : target_result->min_manhattan;
-            target_result->max_manhattan = (manhattan < target_result->max_manhattan) ? manhattan : target_result->max_manhattan;
+            const uint32_t manhattan = (uint32_t) xd[j] + yd[j] + zd[j];
+            target_result->min_manhattan = manhattan < target_result->min_manhattan ? manhattan : target_result->min_manhattan;
+            target_result->max_manhattan = manhattan < target_result->max_manhattan ? manhattan : target_result->max_manhattan;
 
             // Euclidean
-            const uint32_t euclidean = (uint32_t) axd * axd + (uint32_t) ayd * ayd + (uint32_t) azd * azd;
-            target_result->min_euclidean = (euclidean < target_result->min_euclidean) ? euclidean : target_result->min_euclidean;
-            target_result->max_euclidean = (euclidean < target_result->max_euclidean) ? euclidean : target_result->max_euclidean;
+            const uint32_t euclidean = (uint32_t) xd[j] * xd[j] + (uint32_t) yd[j] * yd[j] + (uint32_t) zd[j] * zd[j];
+            target_result->min_euclidean = euclidean < target_result->min_euclidean ? euclidean : target_result->min_euclidean;
+            target_result->max_euclidean = euclidean < target_result->max_euclidean ? euclidean : target_result->max_euclidean;
         }
     }
 }
 
-ComputeResult compute_local(
-    DatasetPartition* data,
-    int my_rank,
-    int cluster_size
-) {
-
-}
-
-ComputeResult compute_remote(
-    DatasetPartition* data,
-    int my_rank,
-    int cluster_size
-) {
-
-}
+// ComputeResult compute_local(
+//     DatasetPartition* data,
+//     int my_rank,
+//     int cluster_size
+// ) {
+//
+// }
+//
+// ComputeResult compute_remote(
+//     DatasetPartition* data,
+//     int my_rank,
+//     int cluster_size
+// ) {
+//
+// }
