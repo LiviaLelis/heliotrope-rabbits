@@ -619,7 +619,8 @@ ComputeResult compute(
 
     // Handle the process in batches, in order to limit memory for cases where N^2 doesn't fit memory.
     // This process induces sincronization and, because of that, degrades performance. The bigger BATCH_SIZE
-    // possible, the better the performance.
+    // possible, the better the performance. Increasing BLOCK_SIZE is a question of balance, as it makes bigger
+    // data transfer, which will reduce the overall communications, but will induce higher latency.
     for (uint32_t batch_n = 0; batch_n < batch_count; batch_n++) {
         dbg_print("[Node %d] Computing batch %u\n", my_rank, batch_n);
         // Compute offsets
@@ -804,9 +805,9 @@ ComputeResult compute(
         for (uint32_t i = 0; i < batch_size; i++) {
             // Introduce local values
             results[i].max_euclidean = max(results[i].max_euclidean, my_results[i].max_euclidean);
-            results[i].min_euclidean = max(results[i].min_euclidean, my_results[i].min_euclidean);
+            results[i].min_euclidean = min(results[i].min_euclidean, my_results[i].min_euclidean);
             results[i].max_manhattan = max(results[i].max_manhattan, my_results[i].max_manhattan);
-            results[i].min_manhattan = max(results[i].min_manhattan, my_results[i].min_manhattan);
+            results[i].min_manhattan = min(results[i].min_manhattan, my_results[i].min_manhattan);
 
             compute_result.max_euclidean = max(compute_result.max_euclidean, results[i].max_euclidean);
             compute_result.sum_max_euclidean += sqrt(results[i].max_euclidean);

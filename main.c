@@ -2,9 +2,19 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 #include <math.h>
 #include <omp.h>
 #include <mpi.h>
+
+// TODO: check for min behavior
+/**
+ * OMP strategies:
+ *  - (more changes; less controversial) allow out of order execution of blocks (fixed size transfers + include idx)
+ *
+ *  - (less change; more controversial) nested parallelism, reserving a group of threads for the top level parallel
+ *    region applying an inner nesting for the block point processing
+ */
 
 /////////////
 // Configs //
@@ -13,6 +23,7 @@
 #define BATCH_SIZE 32
 #define BLOCK_SIZE 256
 #define DEBUG 0
+#define WAIT_ATTACH 0
 
 #define TAG_CONFIG 1
 #define TAG_DATA 2
@@ -122,7 +133,7 @@ typedef struct ComputeResult {
 
 void parse_args(int argc, char* argv[], uint32_t* n, uint32_t* seed, uint32_t* thread_count);
 DatasetPartition* generate_distributed_matrix(uint32_t n, uint32_t seed, int cluster_size, int my_rank);
-ComputeResult compute(const DatasetPartition* data, int my_rank, int cluster_size);
+ComputeResult compute(const DatasetPartition* data, int my_rank, int cluster_size, int thread_count);
 void compute_point(const DatasetPartition* data, ComputeTargetResult* target_result);
 
 // Fast, branch-less, ABS calculation for integers
@@ -174,6 +185,10 @@ static void malloc_check(const void* ptr) {
 //////////
 
 int main(int argc, char* argv[]) {
+    if (DEBUG && WAIT_ATTACH) {
+        sleep(WAIT_ATTACH);
+    }
+
     // MPI Initialization
     mpi_check(MPI_Init(&argc, &argv));
 
@@ -225,7 +240,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    const ComputeResult result = compute(my_data, my_rank, cluster_size);
+    const ComputeResult result = compute(my_data, my_rank, cluster_size, thread_count);
 
     if (my_rank == 0) {
         printf("Distância de Manhattan mínima: %u (soma min: %llu) e máxima: %u (soma max: %llu).\n", result.min_manhattan, result.sum_min_manhattan, result.max_manhattan, result.sum_max_manhattan);
@@ -576,7 +591,8 @@ DatasetPartition* generate_distributed_matrix(
 ComputeResult compute(
     const DatasetPartition* data,
     const int my_rank,
-    const int cluster_size
+    const int cluster_size,
+    const int thread_count
 ) {
     ComputeResult compute_result = {
         .min_euclidean = UINT32_MAX,
@@ -593,7 +609,6 @@ ComputeResult compute(
     // Request/Response data
     const size_t full_size = data->config.n * data->config.n_owned_cols;
     const uint32_t block_count = (full_size - 1) / BLOCK_SIZE + 1;
-
     const uint32_t batch_count = (block_count - 1) / BATCH_SIZE + 1;
 
     // Represent every request as two integers: the index + the x,y,z coords packed in a single 32 bit integer
@@ -619,7 +634,8 @@ ComputeResult compute(
 
     // Handle the process in batches, in order to limit memory for cases where N^2 doesn't fit memory.
     // This process induces sincronization and, because of that, degrades performance. The bigger BATCH_SIZE
-    // possible, the better the performance.
+    // possible, the better the performance. Increasing BLOCK_SIZE is a question of balance, as it makes bigger
+    // data transfer, which will reduce the overall communications, but will induce higher latency.
     for (uint32_t batch_n = 0; batch_n < batch_count; batch_n++) {
         dbg_print("[Node %d] Computing batch %u\n", my_rank, batch_n);
         // Compute offsets
@@ -634,194 +650,229 @@ ComputeResult compute(
         const uint32_t batch_end = ((batch_n + 1) * BATCH_SIZE * BLOCK_SIZE > full_size ? full_size : (batch_n + 1) * BATCH_SIZE * BLOCK_SIZE) - 1;
         const uint32_t batch_size = batch_end - batch_start + 1;
 
-        // Initialize request buffers
-        for(size_t i = 0; i < batch_size; i++) {
-            const uint32_t idx = batch_offset + i;
-            const uint32_t row = idx % data->config.n;
-            const uint32_t col = data->config.owned_cols[idx / data->config.n];
-            const uint32_t global_idx = col * data->config.n + row;
+        // Parallel region
+        #pragma omp parallel
+        {
+            // Send initial information (number of blocks to be sent)
+            // As this isn't computationally intensive, this is better of running in a single thread
+            #pragma omp single nowait
+            {
+                for (uint32_t i = 0; i < cluster_size; i++) {
+                    if (i == my_rank) {
+                        continue;
+                    }
 
-            requests_buffer[2*i] = global_idx;
-            requests_buffer[2*i + 1] = (uint32_t) data->x[idx] << 16 | (uint32_t) data->y[idx] << 8 | data->z[idx];
-
-            results[i] = (ComputeTargetResultLocal){
-                .min_euclidean = UINT32_MAX,
-                .max_euclidean = 0,
-                .min_manhattan = UINT32_MAX,
-                .max_manhattan =  0
-            };
-        }
-
-        // Send initial information (number of blocks to be sent)
-        for (uint32_t i = 0; i < cluster_size; i++) {
-            if (i == my_rank) {
-                continue;
+                    mpi_check(MPI_Isend(&batch_block_count, 1, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &send_handshake[i]));
+                }
             }
 
-            mpi_check(MPI_Isend(&batch_block_count, 1, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &send_handshake[i]));
-        }
+            // Initialize request buffers
+            #pragma omp for nowait
+            for(size_t i = 0; i < batch_size; i++) {
+                const uint32_t idx = batch_offset + i;
+                const uint32_t row = idx % data->config.n;
+                const uint32_t col = data->config.owned_cols[idx / data->config.n];
+                const uint32_t global_idx = col * data->config.n + row;
 
-        // Send/Receive computation results
-        for (uint32_t i = 0; i < batch_size; i+= BLOCK_SIZE) {
-            const uint32_t block_start = i;
-            const uint32_t block_end = (i + BLOCK_SIZE > batch_size ? batch_size : i + BLOCK_SIZE) - 1;
-            const uint32_t actual_size =  block_end - block_start + 1;
+                requests_buffer[2*i] = global_idx;
+                requests_buffer[2*i + 1] = (uint32_t) data->x[idx] << 16 | (uint32_t) data->y[idx] << 8 | data->z[idx];
 
-            // Do the send/receive pair for each node, avoiding the need for sincronization through the use of non-blocking
-            // calls.
-            for (uint32_t dest = 0; dest < cluster_size; dest++) {
-                if (dest == my_rank) {
-                    sends[dest][i / BLOCK_SIZE] = MPI_REQUEST_NULL;
-                    receives[dest][i / BLOCK_SIZE] = MPI_REQUEST_NULL;
-                    continue;
-                }
-
-                const size_t response_offset = (batch_size * dest + i) * 4 ;
-                mpi_check(MPI_Isend(requests_buffer + block_start * 2, actual_size * 2, MPI_UNSIGNED, dest, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &sends[dest][i / BLOCK_SIZE]));
-                mpi_check(MPI_Irecv(response_buffer + response_offset, actual_size * 4, MPI_UNSIGNED, dest, TAG_COMPUTE_RESULT, MPI_COMM_WORLD, &receives[dest][i / BLOCK_SIZE]));
+                results[i] = (ComputeTargetResultLocal){
+                    .min_euclidean = UINT32_MAX,
+                    .max_euclidean = 0,
+                    .min_manhattan = UINT32_MAX,
+                    .max_manhattan =  0
+                };
             }
-        }
 
-        // Receive initial information from every node
-        for (uint32_t i = 0; i < cluster_size; i++) {
-            if (i == my_rank) {
-                continue;
+            // Wait for initialization to complete
+            #pragma omp barrier
+
+            // This should be run in order to guarantee execution order (can be avoided later)
+            #pragma omp single
+            {
+                // Data dependency here makes parallelization unfeasable
+                // Send/Receive computation results
+                for (uint32_t i = 0; i < batch_size; i+= BLOCK_SIZE) {
+                    const uint32_t block_start = i;
+                    const uint32_t block_end = (i + BLOCK_SIZE > batch_size ? batch_size : i + BLOCK_SIZE) - 1;
+                    const uint32_t actual_size =  block_end - block_start + 1;
+
+                    // Do the send/receive pair for each node, avoiding the need for sincronization through the use of non-blocking
+                    // calls.
+                    for (uint32_t dest = 0; dest < cluster_size; dest++) {
+                        if (dest == my_rank) {
+                            sends[dest][i / BLOCK_SIZE] = MPI_REQUEST_NULL;
+                            receives[dest][i / BLOCK_SIZE] = MPI_REQUEST_NULL;
+                            continue;
+                        }
+
+                        const size_t response_offset = (batch_size * dest + i) * 4 ;
+                        mpi_check(MPI_Isend(requests_buffer + block_start * 2, actual_size * 2, MPI_UNSIGNED, dest, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &sends[dest][i / BLOCK_SIZE]));
+                        mpi_check(MPI_Irecv(response_buffer + response_offset, actual_size * 4, MPI_UNSIGNED, dest, TAG_COMPUTE_RESULT, MPI_COMM_WORLD, &receives[dest][i / BLOCK_SIZE]));
+                    }
+                }
+
+                // Receive initial information from every node
+                for (uint32_t i = 0; i < cluster_size; i++) {
+                    if (i == my_rank) {
+                        continue;
+                    }
+                    MPI_Status status;
+                    mpi_check(MPI_Recv(&expected_blocks[i], 1, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &status));
+                    received[i] = 0;
+                }
             }
-            MPI_Status status;
-            mpi_check(MPI_Recv(&expected_blocks[i], 1, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &status));
-            received[i] = 0;
-        }
 
-        // Process incoming requests
-        uint32_t finished = 0;
-        while (finished < cluster_size - 1) {
-            // Check each cluster with pending blocks
-            for(uint32_t i = 0; i < cluster_size; i++) {
-                if (i == my_rank) {
-                    continue;
+            // Implicit barrier here
+
+            // Process incoming requests
+            #pragma omp single nowait
+            {
+                uint32_t finished = 0;
+                while (finished < cluster_size - 1) {
+                    // Check each cluster with pending blocks
+                    for(uint32_t i = 0; i < cluster_size; i++) {
+                        if (i == my_rank) {
+                            continue;
+                        }
+
+                        if (received[i] >= expected_blocks[i]) {
+                            continue;
+                        }
+
+                        // #pragma omp task firstprivate(i)
+                        {
+                            // Retrieve incoming request
+                            MPI_Status recv_status;
+                            int32_t recv_size;
+
+                            mpi_check(MPI_Probe(i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &recv_status));
+                            mpi_check(MPI_Get_count(&recv_status, MPI_UNSIGNED, &recv_size));
+
+                            uint32_t recv_buffer[recv_size];
+                            mpi_check(MPI_Recv(&recv_buffer, recv_size, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &recv_status));
+
+                            const uint32_t actual_block_size = recv_size / 2;
+
+                            // Setup send buffer
+                            uint32_t send_buffer[actual_block_size * 4];
+
+                            // Compute every point
+                            for (uint32_t j = 0; j < actual_block_size; j++) {
+                                const uint32_t send_buffer_offset = 4 * j;
+                                const uint32_t recv_buffer_offset = 2 * j;
+                                ComputeTargetResult cur_result = {
+                                    .idx =  recv_buffer[recv_buffer_offset],
+                                    .x = (data_t) (recv_buffer[recv_buffer_offset + 1] >> 16 & 0x000000ff),
+                                    .y = (data_t) (recv_buffer[recv_buffer_offset + 1] >> 8 & 0x000000ff),
+                                    .z = (data_t) (recv_buffer[recv_buffer_offset + 1] & 0x000000ff),
+                                    .min_euclidean = UINT32_MAX,
+                                    .max_euclidean = 0,
+                                    .min_manhattan = UINT32_MAX,
+                                    .max_manhattan = 0
+                                };
+
+                                compute_point(data, &cur_result);
+
+                                send_buffer[send_buffer_offset] = cur_result.min_euclidean;
+                                send_buffer[send_buffer_offset + 1] = cur_result.max_euclidean;
+                                send_buffer[send_buffer_offset + 2] = cur_result.min_manhattan;
+                                send_buffer[send_buffer_offset + 3] = cur_result.max_manhattan;
+                            }
+
+                            // Send block results
+                            mpi_check(MPI_Send(send_buffer, actual_block_size * 4, MPI_UNSIGNED, i, TAG_COMPUTE_RESULT, MPI_COMM_WORLD));
+
+                            // Track progression
+                            received[i]++;
+                            if (received[i] == expected_blocks[i]) {
+                                #pragma omp atomic update
+                                finished++;
+                            }
+                        }
+                    }
+                    // #pragma omp taskwait
                 }
+            }
 
-                if (received[i] >= expected_blocks[i]) {
-                    continue;
-                }
+            #pragma omp single nowait
+            {
+                // Compute local-to-local values
+                for (uint32_t i = 0; i < batch_size; i++) {
+                    // dbg_print("[Node %d - Thread %d] Computing the results for point %u\n", my_rank, omp_get_thread_num(), i);
+                    const uint32_t idx = batch_offset + i;
+                    const uint32_t row = idx % data->config.n;
+                    const uint32_t col = data->config.owned_cols[idx / data->config.n];
+                    const uint32_t global_idx = col * data->config.n + row;
 
-                // Retrieve incoming request
-                MPI_Status recv_status;
-                int32_t recv_size;
-
-                mpi_check(MPI_Probe(i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &recv_status));
-                mpi_check(MPI_Get_count(&recv_status, MPI_UNSIGNED, &recv_size));
-
-                uint32_t recv_buffer[recv_size];
-                mpi_check(MPI_Recv(&recv_buffer, recv_size, MPI_UNSIGNED, i, TAG_COMPUTE_REQUEST, MPI_COMM_WORLD, &recv_status));
-
-                const uint32_t actual_block_size = recv_size / 2;
-
-                // Setup send buffer
-                uint32_t send_buffer[actual_block_size * 4];
-
-                // Compute every point
-                for (uint32_t j = 0; j < actual_block_size; j++) {
-                    const uint32_t send_buffer_offset = 4 * j;
-                    const uint32_t recv_buffer_offset = 2 * j;
-                    ComputeTargetResult cur_result = {
-                        .idx =  recv_buffer[recv_buffer_offset],
-                        .x = (data_t) (recv_buffer[recv_buffer_offset + 1] >> 16 & 0x000000ff),
-                        .y = (data_t) (recv_buffer[recv_buffer_offset + 1] >> 8 & 0x000000ff),
-                        .z = (data_t) (recv_buffer[recv_buffer_offset + 1] & 0x000000ff),
-                        .min_euclidean = UINT32_MAX,
-                        .max_euclidean = 0,
+                    ComputeTargetResult result = (ComputeTargetResult){
+                        .idx = global_idx,
+                        .x = data->x[idx],
+                        .y = data->y[idx],
+                        .z = data->z[idx],
                         .min_manhattan = UINT32_MAX,
-                        .max_manhattan = 0
+                        .max_manhattan = 0,
+                        .min_euclidean = UINT32_MAX,
+                        .max_euclidean = 0
                     };
 
-                    compute_point(data, &cur_result);
+                    compute_point(data, &result);
 
-                    send_buffer[send_buffer_offset] = cur_result.min_euclidean;
-                    send_buffer[send_buffer_offset + 1] = cur_result.max_euclidean;
-                    send_buffer[send_buffer_offset + 2] = cur_result.min_manhattan;
-                    send_buffer[send_buffer_offset + 3] = cur_result.max_manhattan;
-                }
-
-                // Send block results
-                mpi_check(MPI_Send(send_buffer, actual_block_size * 4, MPI_UNSIGNED, i, TAG_COMPUTE_RESULT, MPI_COMM_WORLD));
-
-                // Track progression
-                received[i]++;
-                if (received[i] == expected_blocks[i]) {
-                    finished++;
+                    my_results[i].min_euclidean = result.min_euclidean;
+                    my_results[i].max_euclidean = result.max_euclidean;
+                    my_results[i].min_manhattan = result.min_manhattan;
+                    my_results[i].max_manhattan = result.max_manhattan;
                 }
             }
-        }
 
-        // Compute local-to-local values
-        for (uint32_t i = 0; i < batch_size; i++) {
-            // dbg_print("[Node %d - Thread %d] Computing the results for point %u\n", my_rank, omp_get_thread_num(), i);
-            const uint32_t idx = batch_offset + i;
-            const uint32_t row = idx % data->config.n;
-            const uint32_t col = data->config.owned_cols[idx / data->config.n];
-            const uint32_t global_idx = col * data->config.n + row;
+            #pragma omp barrier
 
-            ComputeTargetResult result = (ComputeTargetResult){
-                .idx = global_idx,
-                .x = data->x[idx],
-                .y = data->y[idx],
-                .z = data->z[idx],
-                .min_manhattan = UINT32_MAX,
-                .max_manhattan = 0,
-                .min_euclidean = UINT32_MAX,
-                .max_euclidean = 0
-            };
+            #pragma omp single
+            {
+                // Parallelization here is too costly due to synchronization needed for reduction
+                // Aggregate all data incoming from the given cluster
+                for (uint32_t i = 0; i < cluster_size; i++) {
+                    if (i == my_rank) {
+                        continue;
+                    }
+                    mpi_check(MPI_Waitall(batch_block_count, receives[i], MPI_STATUSES_IGNORE));
 
-            compute_point(data, &result);
+                    // Reduce data with each of the results
+                    const uint32_t cluster_offset = batch_size * i;
+                    for (uint32_t j = 0; j < batch_size; j++) {
+                        const uint32_t response_offset = (cluster_offset + j) * 4;
+                        results[j].min_euclidean = min(results[j].min_euclidean, response_buffer[response_offset]);
+                        results[j].max_euclidean = max(results[j].max_euclidean, response_buffer[response_offset + 1]);
+                        results[j].min_manhattan = min(results[j].min_manhattan, response_buffer[response_offset + 2]);
+                        results[j].max_manhattan = max(results[j].max_manhattan, response_buffer[response_offset + 3]);
+                    }
+                }
 
-            my_results[i].min_euclidean = result.min_euclidean;
-            my_results[i].max_euclidean = result.max_euclidean;
-            my_results[i].min_manhattan = result.min_manhattan;
-            my_results[i].max_manhattan = result.max_manhattan;
-        }
+                // Final reduction
+                for (uint32_t i = 0; i < batch_size; i++) {
+                    // Introduce local values
+                    results[i].max_euclidean = max(results[i].max_euclidean, my_results[i].max_euclidean);
+                    results[i].min_euclidean = min(results[i].min_euclidean, my_results[i].min_euclidean);
+                    results[i].max_manhattan = max(results[i].max_manhattan, my_results[i].max_manhattan);
+                    results[i].min_manhattan = min(results[i].min_manhattan, my_results[i].min_manhattan);
 
+                    compute_result.max_euclidean = max(compute_result.max_euclidean, results[i].max_euclidean);
+                    compute_result.sum_max_euclidean += sqrt(results[i].max_euclidean);
 
-        // Aggregate all data incoming from the given cluster
-        for (uint32_t i = 0; i < cluster_size; i++) {
-            if (i == my_rank) {
-                continue;
-            }
-            mpi_check(MPI_Waitall(batch_block_count, receives[i], MPI_STATUSES_IGNORE));
+                    compute_result.min_euclidean = min(compute_result.min_euclidean, results[i].min_euclidean);
+                    if (results[i].min_euclidean != UINT32_MAX) {
+                        compute_result.sum_min_euclidean += sqrt(results[i].min_euclidean);
+                    }
 
-            // Reduce data with each of the results
-            const uint32_t cluster_offset = batch_size * i;
-            for (uint32_t j = 0; j < batch_size; j++) {
-                const uint32_t response_offset = (cluster_offset + j) * 4;
-                results[j].min_euclidean = min(results[j].min_euclidean, response_buffer[response_offset]);
-                results[j].max_euclidean = max(results[j].max_euclidean, response_buffer[response_offset + 1]);
-                results[j].min_manhattan = min(results[j].min_manhattan, response_buffer[response_offset + 2]);
-                results[j].max_manhattan = max(results[j].max_manhattan, response_buffer[response_offset + 3]);
-            }
-        }
+                    compute_result.max_manhattan = max(compute_result.max_manhattan, results[i].max_manhattan);
+                    compute_result.sum_max_manhattan += results[i].max_manhattan;
 
-        // Final reduction
-        for (uint32_t i = 0; i < batch_size; i++) {
-            // Introduce local values
-            results[i].max_euclidean = max(results[i].max_euclidean, my_results[i].max_euclidean);
-            results[i].min_euclidean = max(results[i].min_euclidean, my_results[i].min_euclidean);
-            results[i].max_manhattan = max(results[i].max_manhattan, my_results[i].max_manhattan);
-            results[i].min_manhattan = max(results[i].min_manhattan, my_results[i].min_manhattan);
-
-            compute_result.max_euclidean = max(compute_result.max_euclidean, results[i].max_euclidean);
-            compute_result.sum_max_euclidean += sqrt(results[i].max_euclidean);
-
-            compute_result.min_euclidean = min(compute_result.min_euclidean, results[i].min_euclidean);
-            if (results[i].min_euclidean != UINT32_MAX) {
-                compute_result.sum_min_euclidean += sqrt(results[i].min_euclidean);
-            }
-
-            compute_result.max_manhattan = max(compute_result.max_manhattan, results[i].max_manhattan);
-            compute_result.sum_max_manhattan += results[i].max_manhattan;
-
-            compute_result.min_manhattan= min(compute_result.min_manhattan, results[i].min_manhattan);
-            if (results[i].min_manhattan != UINT32_MAX) {
-                compute_result.sum_min_manhattan += results[i].min_manhattan;
+                    compute_result.min_manhattan= min(compute_result.min_manhattan, results[i].min_manhattan);
+                    if (results[i].min_manhattan != UINT32_MAX) {
+                        compute_result.sum_min_manhattan += results[i].min_manhattan;
+                    }
+                }
             }
         }
     }
