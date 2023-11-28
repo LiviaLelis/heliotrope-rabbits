@@ -4,33 +4,6 @@
 #include <limits.h>
 #include <float.h>
 
-// Debug Control //
-
-#define DEBUG 0
-
-#ifdef DEBUG
-#define dbg_print(fmt, ...) do { \
-if (DEBUG) { \
-fprintf(stderr, "DEBUG: %s:%d:%s(): " fmt, \
-__FILE__, __LINE__, __func__, ##__VA_ARGS__); \
-} \
-} while (0)
-#else
-#define dbg_print(fmt, ...) do {} while (0)
-#endif
-
-#ifdef DEBUG
-#define dbg_print_clean(fmt, ...) do { \
-if (DEBUG) { \
-fprintf(stderr, fmt, ##__VA_ARGS__); \
-} \
-} while (0)
-#else
-#define dbg_print_clean(fmt, ...) do {} while (0)
-#endif
-
-#define errprintf(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__)
-
 // Declarations //
 
 int manhattan_distance(int x1, int y1, int z1, int x2, int y2, int z2);
@@ -39,74 +12,74 @@ void parse_args(int argc, char* argv[], unsigned* n, unsigned* seed);
 
 int main(int argc, char* argv[])
 {
-	unsigned n, seed;
-	parse_args(argc, argv, &n, &seed);
+    unsigned n, seed;
+    parse_args(argc, argv, &n, &seed);
 
-	int *x = malloc(n * n * sizeof(int));
-	int *y = malloc(n * n * sizeof(int));
-	int *z = malloc(n * n * sizeof(int));
+    int *x = malloc(n * n * sizeof(int));
+    int *y = malloc(n * n * sizeof(int));
+    int *z = malloc(n * n * sizeof(int));
 
-	int* targets[3] = {
-		x,
-		y,
-		z
-	};
+    int* targets[3] = {
+        x,
+        y,
+        z
+    };
 
-	srand(seed);
-	for(int o = 0; o < 3; o++) {
-		for(int i = 0; i < n * n; i++) {
-			targets[o][i] = rand() % 100;
-		}
-	}
+    srand(seed);
+    for(int o = 0; o < 3; o++) {
+        for(int i = 0; i < n * n; i++) {
+            targets[o][i] = rand() % 100;
+        }
+    }
 
-	int ij, k;
-	int manhattan_dist;
-	double euclidean_dist;
+    int ij, k;
+    int manhattan_dist;
+    double euclidean_dist;
     
-	int min_manhattan_per_point, min_manhattan = INT_MAX, sum_min_manhattan = 0;
+    int min_manhattan_per_point, min_manhattan = INT_MAX, sum_min_manhattan = 0;
     int max_manhattan_per_point, max_manhattan = 0, sum_max_manhattan = 0;
     double min_euclidean_per_point, min_euclidean = DBL_MAX, sum_min_euclidean = 0.0;
     double max_euclidean_per_point, max_euclidean = 0.0, sum_max_euclidean = 0.0;
 
-	// Compute the solution for each point, then reduce
+    // Compute the solution for each point, then reduce
     for (ij = 0; ij < n*n; ij++)
-	{
-		min_manhattan_per_point = INT_MAX;
-		max_manhattan_per_point = 0;
-		min_euclidean_per_point = DBL_MAX;
-		max_euclidean_per_point = 0;
+    {
+        min_manhattan_per_point = INT_MAX;
+        max_manhattan_per_point = 0;
+        min_euclidean_per_point = DBL_MAX;
+        max_euclidean_per_point = 0;
 
-		// Compute sub-solutions to each point
-		for (k = ij+1; k < n*n; k++)
-		{
+        // Compute sub-solutions to each point
+        for (k = ij+1; k < n*n; k++)
+        {
             manhattan_dist = manhattan_distance(x[ij], y[ij], z[ij], x[k], y[k], z[k]);
             euclidean_dist = euclidean_distance(x[ij], y[ij], z[ij], x[k], y[k], z[k]);
 
-			// acerta os mínimos e os máximos locais ao ponto de origem (um i,j)
+            // acerta os mínimos e os máximos locais ao ponto de origem (um i,j)
             if (manhattan_dist < min_manhattan_per_point)
-			{
+            {
                 min_manhattan_per_point = manhattan_dist;
-			}
+            }
 
             if (manhattan_dist > max_manhattan_per_point) 
             {
-				max_manhattan_per_point = manhattan_dist;
-			}
-					
+                max_manhattan_per_point = manhattan_dist;
+            }
+                    
             if (euclidean_dist < min_euclidean_per_point) 
             {
-				min_euclidean_per_point = euclidean_dist;
-			}
-					
+                min_euclidean_per_point = euclidean_dist;
+            }
+                    
             if (euclidean_dist > max_euclidean_per_point) 
-			{
+            {
                 max_euclidean_per_point = euclidean_dist;
-			}
+            }
             
         }
 
-		// Reduce
-		if (min_manhattan_per_point < min_manhattan)
+        // Reduce
+        if (min_manhattan_per_point < min_manhattan)
             min_manhattan = min_manhattan_per_point;
 
         if (max_manhattan_per_point > max_manhattan) 
@@ -117,14 +90,14 @@ int main(int argc, char* argv[])
             
         if (max_euclidean_per_point > max_euclidean) 
             max_euclidean = max_euclidean_per_point;
-			
-		if (min_manhattan_per_point != INT_MAX && min_euclidean_per_point != DBL_MAX)
-		{
-			sum_min_manhattan += min_manhattan_per_point;
-			sum_max_manhattan += max_manhattan_per_point;
-			sum_min_euclidean += min_euclidean_per_point;
-			sum_max_euclidean += max_euclidean_per_point;
-		}
+            
+        if (min_manhattan_per_point != INT_MAX && min_euclidean_per_point != DBL_MAX)
+        {
+            sum_min_manhattan += min_manhattan_per_point;
+            sum_max_manhattan += max_manhattan_per_point;
+            sum_min_euclidean += min_euclidean_per_point;
+            sum_max_euclidean += max_euclidean_per_point;
+        }
     }
 
     printf("Distância de Manhattan mínima: %d (soma min: %d) e máxima: %d (soma max: %d).\n", min_manhattan, sum_min_manhattan, max_manhattan, sum_max_manhattan);
@@ -147,20 +120,16 @@ void parse_args(int argc, char* argv[], unsigned* n, unsigned* seed) {
     // Load matrix rank
     if (argc >= 2) {
         *n = strtoul(argv[1], NULL, 10);
-        dbg_print("Received CLI arg n=%u\n", *n);
     }
     else {
         *n = 10;
-        dbg_print("Using fallback CLI arg n=%u\n", *n);
     }
 
     // Load RNG seed
     if (argc >= 3) {
         *seed = strtoul(argv[2], NULL, 10);
-        dbg_print("Received CLI arg seed=%u\n", *seed);
     }
     else {
         *seed = 1;
-        dbg_print("Using fallback CLI arg seed=%u\n", *seed);
     }
 }
